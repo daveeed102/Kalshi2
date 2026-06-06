@@ -26,14 +26,14 @@ const CONFIG = {
     timeWindowMinutes: parseInt(process.env.TIME_WINDOW_MINUTES)   || 15,
     minTraders:        parseInt(process.env.MIN_TRADERS_FOR_SIGNAL) || 2,
     matchThreshold:    parseInt(process.env.KALSHI_MATCH_THRESHOLD) || 70,
-    leaderboardSize:   parseInt(process.env.LEADERBOARD_SIZE)       || 50,
+    leaderboardSize:   parseInt(process.env.LEADERBOARD_SIZE)       || 150,
   },
   polling: {
     tradesMinutes:    parseInt(process.env.POLL_TRADES_MINUTES)    || 5,
     leaderboardHours: parseInt(process.env.POLL_LEADERBOARD_HOURS) || 6,
   },
   dashboard: {
-    port: parseInt(process.env.DASHBOARD_PORT) || 3000,
+    port: parseInt(process.env.PORT || process.env.DASHBOARD_PORT) || 3000,
   },
 };
 
@@ -116,18 +116,45 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function fetchLeaderboard() {
   try {
     log('POLL', 'Fetching Polymarket leaderboard...');
-    const r = await fetch(`${GAMMA}/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}`);
-    const data = r.ok ? await r.json() : null;
-    const raw  = data?.data || data || [];
 
-    // Fallback to CLOB if Gamma returns empty
-    if(!raw.length) {
-      const r2   = await fetch(`${CLOB}/profiles/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}`);
-      const d2   = r2.ok ? await r2.json() : {};
-      const raw2 = d2?.data || d2 || [];
-      return processLeaderboard(raw2);
+    // Try multiple endpoints and response shapes
+    const endpoints = [
+      // Crypto-specific leaderboard — exactly what you see on polymarket.com/leaderboard with Crypto filter
+      `${GAMMA}/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}&category=crypto`,
+      `${GAMMA}/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}&tag=crypto`,
+      `${GAMMA}/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}`,
+      `${CLOB}/profiles/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}&category=crypto`,
+      `${CLOB}/profiles/leaderboard?window=monthly&limit=${CONFIG.signal.leaderboardSize}`,
+    ];
+
+    for(const url of endpoints) {
+      try {
+        const r    = await fetch(url, { headers:{ Accept:'application/json' } });
+        if(!r.ok) continue;
+        const data = await r.json();
+
+        // Handle any response shape — find the array
+        let raw = null;
+        if(Array.isArray(data))           raw = data;
+        else if(Array.isArray(data?.data)) raw = data.data;
+        else if(Array.isArray(data?.results)) raw = data.results;
+        else if(Array.isArray(data?.leaderboard)) raw = data.leaderboard;
+        else {
+          // Try to find any array property
+          for(const v of Object.values(data||{})) {
+            if(Array.isArray(v) && v.length > 0) { raw = v; break; }
+          }
+        }
+
+        if(raw && raw.length > 0) {
+          log('POLL', `Leaderboard fetched from ${url.split('?')[0]}`);
+          return processLeaderboard(raw);
+        }
+      } catch(e2) { log('WARN', `Endpoint failed: ${e2.message}`); }
     }
-    return processLeaderboard(raw);
+
+    log('WARN', 'All leaderboard endpoints failed — using mock for testing');
+    return [];
   } catch(e) {
     log('ERROR', `fetchLeaderboard: ${e.message}`);
     return [];
@@ -153,18 +180,32 @@ async function fetchTraderTrades(address) {
     if(!r.ok) return [];
     const data   = await r.json();
     const trades = data?.data || data || [];
-    return trades.map(t => ({
-      id:             t.id || `${address}-${t.timestamp}-${Math.random()}`,
-      trader_address: address,
-      market_id:      t.market || t.marketId || t.condition_id || '',
-      market_title:   t.title  || t.market_title || '',
-      outcome:        t.outcome_index===0 ? 'YES' : t.outcome_index===1 ? 'NO' : (t.outcome||'YES'),
-      side:           (t.side||t.type||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL',
-      price:          parseFloat(t.price||0),
-      size:           parseFloat(t.size||t.matched||0),
-      usd_value:      parseFloat(t.usdcSize || (parseFloat(t.price||0)*parseFloat(t.size||0))),
-      timestamp:      t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : Math.floor(Date.now()/1000),
-    }));
+    // Crypto keywords — only track crypto markets
+    const CRYPTO_KEYWORDS = [
+      'btc','bitcoin','eth','ethereum','sol','solana','xrp','ripple',
+      'doge','dogecoin','bnb','binance','hype','hyperliquid','avax',
+      'avalanche','link','chainlink','matic','polygon','ada','cardano',
+      'crypto','price','above','below','higher','lower','15 min','15min',
+    ];
+    const isCrypto = t => {
+      const title = (t.title||t.market_title||'').toLowerCase();
+      return CRYPTO_KEYWORDS.some(k => title.includes(k));
+    };
+
+    return trades
+      .filter(isCrypto)
+      .map(t => ({
+        id:             t.id || `${address}-${t.timestamp}-${Math.random()}`,
+        trader_address: address,
+        market_id:      t.market || t.marketId || t.condition_id || '',
+        market_title:   t.title  || t.market_title || '',
+        outcome:        t.outcome_index===0 ? 'YES' : t.outcome_index===1 ? 'NO' : (t.outcome||'YES'),
+        side:           (t.side||t.type||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL',
+        price:          parseFloat(t.price||0),
+        size:           parseFloat(t.size||t.matched||0),
+        usd_value:      parseFloat(t.usdcSize || (parseFloat(t.price||0)*parseFloat(t.size||0))),
+        timestamp:      t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : Math.floor(Date.now()/1000),
+      }));
   } catch(e) { return []; }
 }
 
@@ -225,8 +266,30 @@ function detectSignals() {
     if(unique.length < CONFIG.signal.minTraders) continue;
 
     const best     = unique.reduce((a,b) => b.usd_value > a.usd_value ? b : a);
-    const existing = DB.signalExists.get(best.market_id, best.outcome, Math.floor(Date.now()/1000)-86400);
-    if(existing) continue;
+    // Dedup: skip if we already signaled this market+outcome in last 4 hours
+    const existing = DB.signalExists.get(best.market_id, best.outcome, Math.floor(Date.now()/1000)-14400);
+    if(existing) {
+      log('SKIP', `Already signaled "${best.market_title?.slice(0,40)}" ${best.outcome} in last 4h`);
+      continue;
+    }
+
+    // Also skip if title is too similar to a recent signal (catches same market with different ID)
+    const recentSigs = DB.getRecentSignals.all(20);
+    const titleDup = recentSigs.some(s => {
+      if((Math.floor(Date.now()/1000) - s.detected_at) > 14400) return false; // older than 4h
+      if(s.outcome !== best.outcome) return false;
+      const a = (s.market_title||'').toLowerCase();
+      const b = (best.market_title||'').toLowerCase();
+      // Check if they share 3+ words
+      const aWords = a.split(/\W+/).filter(w=>w.length>3);
+      const bWords = b.split(/\W+/).filter(w=>w.length>3);
+      const shared = aWords.filter(w=>bWords.includes(w)).length;
+      return shared >= 3;
+    });
+    if(titleDup) {
+      log('SKIP', `Similar signal already sent recently for "${best.market_title?.slice(0,40)}"`);
+      continue;
+    }
 
     const avgPrice = unique.reduce((s,t)=>s+t.price,0)/unique.length;
     const signal   = {
@@ -253,15 +316,38 @@ function kalshiHeaders() {
   return { 'Content-Type':'application/json', 'Authorization':`Bearer ${CONFIG.kalshi.apiKey}` };
 }
 
-async function searchKalshi(query='', limit=50) {
+const KALSHI_CRYPTO_TICKERS = ['BTC','ETH','SOL','XRP','DOGE','BNB','HYPE','AVAX','LINK','MATIC','ADA'];
+
+async function searchKalshi(query='', limit=100) {
   try {
     const params = new URLSearchParams({ limit:String(limit), status:'open' });
     if(query) params.set('search', query);
     const r = await fetch(`${CONFIG.kalshi.baseUrl}/trade-api/v2/markets?${params}`, { headers:kalshiHeaders() });
     if(!r.ok) return [];
     const d = await r.json();
-    return d.markets || [];
+    const markets = d.markets || [];
+
+    // Only return 15-minute crypto markets
+    return markets.filter(m => {
+      const title = (m.title||m.subtitle||'').toUpperCase();
+      const isCrypto = KALSHI_CRYPTO_TICKERS.some(t => title.includes(t));
+      const is15min  = title.includes('15') || (m.ticker||'').includes('15');
+      return isCrypto && is15min;
+    });
   } catch(e) { return []; }
+}
+
+async function fetchAllKalshi15minMarkets() {
+  // Fetch all open 15min crypto Kalshi markets upfront
+  const all = [];
+  for(const coin of KALSHI_CRYPTO_TICKERS) {
+    const markets = await searchKalshi(coin, 50);
+    all.push(...markets);
+    await sleep(100);
+  }
+  // Deduplicate by ticker
+  const seen = new Set();
+  return all.filter(m => { if(seen.has(m.ticker)) return false; seen.add(m.ticker); return true; });
 }
 
 async function getKalshiMarket(ticker) {
@@ -312,10 +398,13 @@ async function findKalshiMatch(signal) {
     .filter(w=>w.length>3).slice(0,3).join(' ');
 
   if(!keywords) return null;
-  log('MATCH', `Searching Kalshi: "${keywords}"`);
+  log('MATCH', `Searching Kalshi 15min crypto: "${keywords}"`);
 
   const markets = await searchKalshi(keywords);
-  if(!markets.length) return null;
+  if(!markets.length) {
+    log('SKIP', `No 15min crypto Kalshi markets for: "${keywords}"`);
+    return null;
+  }
 
   const scored = markets
     .map(m => ({ market:m, confidence:scoreMatch(signal.market_title, signal.outcome, m) }))
@@ -363,7 +452,18 @@ async function alertSignal(signal, match) {
 }
 
 // ── PROCESS SIGNAL ────────────────────────────────────────────
+// Track signals currently being processed to avoid duplicate alerts
+const processingSignals = new Set();
+
 async function processSignal(signal) {
+  // Skip if same market+outcome is already being processed right now
+  const key = `${signal.market_id}::${signal.outcome}`;
+  if(processingSignals.has(key)) {
+    log('SKIP', `Already processing ${key} — skipping duplicate`);
+    return;
+  }
+  processingSignals.add(key);
+
   log('SIGNAL', `Processing: "${signal.market_title?.slice(0,50)}" | ${signal.outcome} | ${signal.trader_count} traders`);
 
   let match = null;
@@ -391,6 +491,9 @@ async function processSignal(signal) {
     status:            'ALERTED',
     skip_reason:       null,
   });
+
+  // Release lock
+  processingSignals.delete(`${signal.market_id}::${signal.outcome}`);
 }
 
 // ── POLL CYCLE ────────────────────────────────────────────────
@@ -466,7 +569,7 @@ code{font-size:.78rem;color:#94a3b8}
   <div class="card"><div class="val">${sigs.length}</div><div class="label">Recent Signals</div></div>
   <div class="card"><div class="val">${sigs.filter(s=>s.status==='ALERTED').length}</div><div class="label">Alerted</div></div>
   <div class="card"><div class="val">${sigs.filter(s=>s.kalshi_ticker).length}</div><div class="label">Kalshi Matched</div></div>
-  <div class="card"><div class="val">${trads.length}</div><div class="label">Traders Tracked</div></div>
+  <div class="card"><div class="val">${trads.length}/150</div><div class="label">Traders Tracked</div></div>
 </div>
 <h2>🎯 Recent Signals</h2>
 <table><tr><th>Time</th><th>Market</th><th>Side</th><th>Traders</th><th>Avg Price</th><th>Kalshi</th><th>Confidence</th><th>Price</th><th>Status</th></tr>
@@ -490,7 +593,7 @@ async function main() {
   console.log('║  📊 POLYMARKET → KALSHI SIGNAL BOT                           ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
-  log('INFO', `Window:${CONFIG.signal.timeWindowMinutes}min | MinTraders:${CONFIG.signal.minTraders} | Threshold:${CONFIG.signal.matchThreshold}/100`);
+  log('INFO', `Window:${CONFIG.signal.timeWindowMinutes}min | MinTraders:${CONFIG.signal.minTraders} | Threshold:${CONFIG.signal.matchThreshold}/100 | Crypto 15min only`);
   if(!CONFIG.kalshi.apiKey) log('WARN', 'No Kalshi API key — matching disabled');
 
   startDashboard();
@@ -503,7 +606,8 @@ async function main() {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `👥 Tracking **${traders.length}** top traders\n` +
     `⏱  Window: **${CONFIG.signal.timeWindowMinutes}min** | Min: **${CONFIG.signal.minTraders}** traders\n` +
-    `🔗 Kalshi threshold: **${CONFIG.signal.matchThreshold}/100**`
+    `🔗 Kalshi threshold: **${CONFIG.signal.matchThreshold}/100**\n` +
+    `🪙 Crypto 15min markets only | No duplicate signals`
   );
 
   await runPollCycle();
