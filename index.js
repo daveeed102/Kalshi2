@@ -685,41 +685,71 @@ async function main() {
     if((now - lastPollTime) < interval * 1000) return; // not time yet
     lastPollTime = now;
 
-    // Poll top traders for recent trades directly
+    // Poll ALL top traders for recent trades
     const cutoff  = Math.floor(Date.now()/1000) - CONFIG.windowSecs;
-    const traders = [...TOP_TRADERS].slice(0, 25); // poll 25 at a time to stay fast
+    const traders = [...TOP_TRADERS];
+    let tradesSeen = 0;
+
     for(const trader of traders) {
       try {
         const r = await fetch(`${CONFIG.CLOB_REST}/trades?user=${trader}&limit=20`);
-        if(!r.ok) continue;
+        if(!r.ok) {
+          log('WARN', `CLOB ${r.status} for ${trader.slice(0,10)}`);
+          continue;
+        }
         const d      = await r.json();
-        const trades = d?.data || d || [];
+        const trades = d?.data || (Array.isArray(d) ? d : []);
+
+        // First trader — log raw structure so we can see what fields exist
+        if(tradesSeen === 0 && trades.length > 0) {
+          log('INFO', `CLOB sample trade fields: ${Object.keys(trades[0]).join(', ')}`);
+          log('INFO', `CLOB sample: ${JSON.stringify(trades[0]).slice(0,200)}`);
+        }
+
         for(const t of trades) {
           const ts = t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : 0;
           if(ts < cutoff) continue;
-          // Match to a known Kalshi coin by market title
-          const title = (t.title || t.market_title || '').toLowerCase();
+          tradesSeen++;
+
+          // Match coin from any available title field
+          const title = (t.title || t.market_title || t.market || '').toLowerCase();
           let coin = null;
-          if(title.includes('bitcoin') || title.includes('btc'))      coin = 'BTC';
+          if(title.includes('bitcoin') || title.includes('btc'))       coin = 'BTC';
           else if(title.includes('ethereum') || title.includes('eth')) coin = 'ETH';
           else if(title.includes('solana') || title.includes('sol'))   coin = 'SOL';
           else if(title.includes('xrp') || title.includes('ripple'))   coin = 'XRP';
-          else if(title.includes('doge'))                              coin = 'DOGE';
+          else if(title.includes('doge'))                               coin = 'DOGE';
           if(!coin) continue;
-          if(!title.includes('up or down') && !title.includes('5')) continue;
-          const side    = (t.side||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL';
-          const sizeUsd = parseFloat(t.price||0) * parseFloat(t.size||0) * 100;
+
+          // Accept any crypto up/down market — 5min or 15min
+          if(!title.includes('up or down') && !title.includes('above') && !title.includes('below')) continue;
+
+          const side    = (t.side||t.type||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL';
+          const sizeUsd = parseFloat(t.price||0) * parseFloat(t.size||t.matched||0) * 100;
           if(sizeUsd < CONFIG.minTradeUsd) continue;
+
+          log('INFO', `👀 TOP TRADER ${trader.slice(0,10)}... | ${coin} ${side} | $${sizeUsd.toFixed(0)} | ${title.slice(0,40)}`);
+
           await processTrade({
-            id: t.id || `${trader}-${ts}`,
-            maker: trader, taker: trader,
-            asset_id: null, price: t.price,
-            size: t.size, side, timestamp: t.timestamp,
-            _coin: coin,
+            id:        t.id || `${trader}-${ts}`,
+            maker:     trader,
+            taker:     trader,
+            asset_id:  null,
+            price:     t.price,
+            size:      t.size || t.matched,
+            side,
+            timestamp: t.timestamp,
+            _coin:     coin,
           });
         }
-        await new Promise(r => setTimeout(r, 100));
-      } catch(e) {}
+        await new Promise(r => setTimeout(r, 80));
+      } catch(e) {
+        log('WARN', `Poll error ${trader.slice(0,10)}: ${e.message}`);
+      }
+    }
+
+    if(inWindow && tradesSeen === 0) {
+      log('INFO', `  Polled ${traders.length} traders — 0 matching trades in window`);
     }
 
     // Log status every check when in window, every 5min outside
