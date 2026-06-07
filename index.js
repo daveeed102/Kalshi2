@@ -10,6 +10,8 @@ const path      = require('path');
 const fetch     = require('node-fetch');
 const WebSocket = require('ws');
 const Database  = require('better-sqlite3');
+const crypto    = require('crypto'); // built-in Node.js — no install needed
+
 
 // ── CONFIG ────────────────────────────────────────────────────
 const CONFIG = {
@@ -208,6 +210,98 @@ async function fetchKalshiMarket(coin) {
   }
 }
 
+// ── KALSHI ORDER PLACEMENT ───────────────────────────────────
+
+function signKalshiRequest(method, path, timestamp, privateKeyPem) {
+  // Kalshi requires RSA-PSS SHA256 signature
+  // Sign: timestamp + method + path (no query params)
+  const message = timestamp + method.toUpperCase() + path;
+  try {
+    const sign = crypto.createSign('SHA256');
+    sign.update(message);
+    sign.end();
+    // RSA-PSS padding
+    const sig = sign.sign({
+      key:               privateKeyPem,
+      padding:           crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength:        crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    });
+    return sig.toString('base64');
+  } catch(e) {
+    log('ERROR', `Kalshi signing failed: ${e.message}`);
+    return null;
+  }
+}
+
+function kalshiAuthHeaders(method, urlPath) {
+  const timestamp = Date.now().toString();
+  const privateKey = process.env.KALSHI_PRIVATE_KEY || '';
+  const apiKeyId   = process.env.KALSHI_API_KEY     || '';
+
+  if(!privateKey || !apiKeyId) return null;
+
+  const sig = signKalshiRequest(method, urlPath, timestamp, privateKey);
+  if(!sig) return null;
+
+  return {
+    'Content-Type':           'application/json',
+    'KALSHI-ACCESS-KEY':      apiKeyId,
+    'KALSHI-ACCESS-SIGNATURE': sig,
+    'KALSHI-ACCESS-TIMESTAMP': timestamp,
+  };
+}
+
+async function placeKalshiOrder(ticker, side, sizeUsd, currentPrice) {
+  const orderPath = '/trade-api/v2/portfolio/orders';
+  const headers   = kalshiAuthHeaders('POST', orderPath);
+
+  if(!headers) {
+    log('ERROR', 'Cannot place order — missing KALSHI_API_KEY or KALSHI_PRIVATE_KEY');
+    return null;
+  }
+
+  // Calculate contracts — each contract costs `price` cents
+  // sizeUsd e.g. $5, price e.g. 0.74 = 74 cents = $0.74 per contract
+  const pricePerContract = currentPrice || 0.5;
+  const contracts = Math.max(1, Math.floor(sizeUsd / pricePerContract));
+  const limitPrice = Math.round(pricePerContract * 100) / 100; // round to 2dp
+
+  const orderId = crypto.randomUUID();
+  const body = {
+    ticker:           ticker,
+    client_order_id:  orderId,
+    side:             side === 'YES' ? 'yes' : 'no',
+    count:            contracts,
+    price:            limitPrice.toFixed(2),
+    time_in_force:    'fill_or_kill', // fast execution, cancel if not filled immediately
+    type:             'limit',
+  };
+
+  log('INFO', `Placing Kalshi order: ${ticker} ${side} | ${contracts} contracts @ $${limitPrice} | ~$${sizeUsd}`);
+
+  try {
+    const r = await fetch(`${CONFIG.kalshiUrl}${orderPath}`, {
+      method:  'POST',
+      headers,
+      body:    JSON.stringify(body),
+    });
+
+    const d = await r.json();
+
+    if(!r.ok) {
+      log('ERROR', `Kalshi order failed ${r.status}: ${JSON.stringify(d)}`);
+      return null;
+    }
+
+    const order = d.order || d;
+    log('INFO', `✅ Kalshi order placed: ${order.order_id || orderId} | ${ticker} ${side} | ${contracts} contracts`);
+    return order;
+  } catch(e) {
+    log('ERROR', `placeKalshiOrder: ${e.message}`);
+    return null;
+  }
+}
+
 // ── PROCESS A TRADE ───────────────────────────────────────────
 async function processTrade(trade) {
   const { maker, taker, asset_id, price, size, side, id, timestamp } = trade;
@@ -283,10 +377,6 @@ async function processTrade(trade) {
   }
 }
 
-// ── PAPER TRADING STATE ──────────────────────────────────────
-const PAPER_MODE = process.env.PAPER_TRADING !== 'false'; // default ON
-const paperTrades = [];
-
 // ── FIRE SIGNAL ───────────────────────────────────────────────
 async function fireSignal(coin, side, traders, ts) {
   const secsLeft  = secsToNextSettlement();
@@ -337,41 +427,25 @@ async function fireSignal(coin, side, traders, ts) {
 
   log('SIGNAL', `Alert fired: ${coin} ${side} → ${kalshiTicker} | ${secsLeft}s left`);
 
-  // Paper trade simulation
-  if(PAPER_MODE) {
-    const entry = kalshiPrice || 0.5;
-    const sizeUsd = 5; // simulate $5 trade
-    const paper = { id: Date.now(), coin, side, ticker: kalshiTicker, entry, sizeUsd, openedAt: Date.now(), secsLeft, settled: false };
-    paperTrades.push(paper);
-    log('PAPER', `📋 Paper trade opened: ${coin} ${side} @ ${(entry*100).toFixed(1)}¢ | $${sizeUsd} | settles in ${secsLeft}s`);
+  // ── PLACE REAL ORDER ON KALSHI ──────────────────────────────
+  const ORDER_SIZE_USD = parseFloat(process.env.ORDER_SIZE_USD) || 5;
+  const order = await placeKalshiOrder(kalshiTicker, side, ORDER_SIZE_USD, kalshiPrice);
 
-    // Auto-settle after the window closes
-    setTimeout(async () => {
-      // Simulate outcome — fetch current Kalshi price as proxy
-      try {
-        const mk = await fetchKalshiMarket(coin);
-        const exitPrice = mk?.price || (Math.random() > 0.5 ? 1.0 : 0.0); // 1 = win, 0 = loss
-        const pnl = (exitPrice - paper.entry) * (paper.sizeUsd / paper.entry);
-        paper.settled  = true;
-        paper.exitPrice = exitPrice;
-        paper.pnl       = pnl;
-        const won = pnl > 0;
-        log('PAPER', `📋 Paper trade settled: ${coin} ${side} | ${won?'WIN':'LOSS'} | PnL: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
-
-        const wins   = paperTrades.filter(p=>p.settled&&p.pnl>0).length;
-        const losses = paperTrades.filter(p=>p.settled&&p.pnl<=0).length;
-        const totalPnl = paperTrades.filter(p=>p.settled).reduce((s,p)=>s+p.pnl,0);
-
-        await discord([
-          `📋 **PAPER TRADE SETTLED — ${coin} ${side}**`,
-          `━━━━━━━━━━━━━━━━━━━━`,
-          `📥 Entry: **${(paper.entry*100).toFixed(1)}¢** | Exit: **${(exitPrice*100).toFixed(1)}¢**`,
-          `${won?'📈':'📉'} PnL: **${pnl>=0?'+':''}$${pnl.toFixed(2)}**`,
-          `━━━━━━━━━━━━━━━━━━━━`,
-          `📊 Session: **${wins}W/${losses}L** | Total PnL: **${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}**`,
-        ].join('\n'));
-      } catch(e) { log('ERROR',`Paper settle: ${e.message}`); }
-    }, (secsLeft + 5) * 1000);
+  if(order) {
+    await discord([
+      `✅ **ORDER PLACED — ${coin} ${side}**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🎯 **${kalshiTicker}** | **${side}**`,
+      `💸 Size: **~$${ORDER_SIZE_USD}** | Price: **${kalshiPrice ? (kalshiPrice*100).toFixed(1)+'¢' : 'market'}**`,
+      `🆔 Order ID: \`${order.order_id || 'submitted'}\``,
+      `⏱  **${secsLeft}s** until settlement`,
+    ].join('\n'));
+  } else {
+    await discord([
+      `❌ **ORDER FAILED — ${coin} ${side}**`,
+      `Could not place order on Kalshi — check logs`,
+      `Manual entry: https://kalshi.com/markets/${kalshiTicker.toLowerCase()}`,
+    ].join('\n'));
   }
 }
 
@@ -632,20 +706,24 @@ async function main() {
   // Connect WebSocket
   connectWebSocket(markets);
 
-  // Refresh markets every 5 minutes (new 5-min markets open constantly)
+  // Refresh markets every 5 minutes — update list WITHOUT closing WebSocket
   setInterval(async () => {
     log('INFO', 'Refreshing market list...');
     const fresh = await fetchPolyMarkets();
     if(fresh.length > 0) {
       wsMarkets = fresh;
-      // Reconnect WS with new markets
+      // Re-subscribe with new token IDs without closing the connection
       if(ws?.readyState === WebSocket.OPEN) {
-        ws.close();
+        const newIds = fresh
+          .flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean))
+          .slice(0, 200);
+        if(newIds.length > 0) {
+          ws.send(JSON.stringify({ auth:{}, type:'Market', markets:[], assets:newIds }));
+          log('INFO', `Re-subscribed to ${newIds.length} token IDs (no reconnect needed)`);
+        }
       }
     }
-    // Clear Kalshi cache every refresh
     kalshiCache.clear();
-    // Clear alert dedup set every 15min window
     alertedThisWindow.clear();
   }, 5 * 60 * 1000);
 
@@ -670,10 +748,7 @@ async function main() {
     }
   }, 5 * 60 * 1000);
 
-  log('INFO', `✅ Bot running | Paper trading: ${PAPER_MODE?'ON (simulating $5 trades)':'OFF'}`);
-  if(PAPER_MODE) {
-    log('INFO', 'PAPER MODE: Signals will be alerted AND simulated. Set PAPER_TRADING=false to disable.');
-  }
+  log('INFO', `✅ Bot running — LIVE ORDER MODE | $${parseFloat(process.env.ORDER_SIZE_USD)||5} per trade`);
 }
 
 process.on('SIGINT', async () => {
