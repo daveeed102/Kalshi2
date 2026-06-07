@@ -141,7 +141,7 @@ const marketCache = new Map(); // series → { ticker, yesAsk, yesBid }
 async function getActiveTicker(series) {
   try {
     const r = await fetch(
-      `${CONFIG.kalshiPublic}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=5`
+      `${CONFIG.kalshiBase}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=5`
     );
     if(!r.ok) return null;
     const d  = await r.json();
@@ -347,60 +347,81 @@ async function pollKalshiTrades() {
     if(!market?.ticker) continue;
 
     try {
-      // Use public external API — no auth needed, correct endpoint
-      const url = `${CONFIG.kalshiPublic}/trade-api/v2/trades?ticker=${market.ticker}&limit=50`;
-      const r   = await fetch(url, { headers: { 'Accept': 'application/json' } });
-
+      // Use orderbook endpoint — confirmed working with no auth
+      const r = await fetch(
+        `${CONFIG.kalshiBase}/trade-api/v2/markets/${market.ticker}/orderbook?depth=5`
+      );
       if(!r.ok) {
-        const body = await r.text().catch(()=>'');
-        log('WARN', `Poll ${coin} ${r.status}: ${market.ticker} — ${body.slice(0,80)}`);
+        log('WARN', `Orderbook ${coin} ${r.status}`);
         continue;
       }
 
-      const d      = await r.json();
-      const trades = d.trades || [];
-      const cutoff = Math.floor(Date.now()/1000) - 120;
+      const d  = await r.json();
+      const ob = d.orderbook || d.orderbook_fp || d;
 
-      if(trades.length > 0) {
-        log('INFO', `Poll ${coin}: ${trades.length} trades on ${market.ticker}`);
-        // Log first trade structure once so we know the fields
-        if(!pollKalshiTrades._logged) {
-          log('INFO', `Trade fields: ${Object.keys(trades[0]).join(', ')}`);
-          log('INFO', `Sample: ${JSON.stringify(trades[0]).slice(0,150)}`);
-          pollKalshiTrades._logged = true;
-        }
+      // Get current best yes ask price
+      const yesBids = ob.yes || ob.yes_bids || ob.yes_dollars || [];
+      const noBids  = ob.no  || ob.no_bids  || ob.no_dollars  || [];
+
+      // Top of book — highest yes bid = someone willing to pay this for YES
+      let topYesBid = null, topYesSize = null;
+      let topNoBid  = null, topNoSize  = null;
+
+      if(yesBids.length > 0) {
+        // Format is [[price, size], ...] sorted desc
+        const top = yesBids[0];
+        topYesBid  = Array.isArray(top) ? parseFloat(top[0]) : parseFloat(top);
+        topYesSize = Array.isArray(top) ? parseFloat(top[1]) : 1;
+      }
+      if(noBids.length > 0) {
+        const top = noBids[0];
+        topNoBid  = Array.isArray(top) ? parseFloat(top[0]) : parseFloat(top);
+        topNoSize = Array.isArray(top) ? parseFloat(top[1]) : 1;
       }
 
-      for(const t of trades) {
-        const ts = t.created_time
-          ? Math.floor(new Date(t.created_time).getTime()/1000)
-          : Math.floor(Date.now()/1000);
-        if(ts < cutoff) continue;
+      // Convert dollar strings to cents if needed
+      if(topYesBid !== null && topYesBid < 1) topYesBid = Math.round(topYesBid * 100);
+      if(topNoBid  !== null && topNoBid  < 1) topNoBid  = Math.round(topNoBid  * 100);
 
-        // Normalize price — docs say yes_price_dollars e.g. "0.56"
-        // Convert to cents integer
-        let yesPriceCents = null;
-        let noPriceCents  = null;
-        if(t.yes_price)         yesPriceCents = parseInt(t.yes_price);
-        else if(t.yes_price_dollars) yesPriceCents = Math.round(parseFloat(t.yes_price_dollars) * 100);
-        if(t.no_price)          noPriceCents  = parseInt(t.no_price);
-        else if(t.no_price_dollars)  noPriceCents  = Math.round(parseFloat(t.no_price_dollars) * 100);
+      if(topYesBid !== null || topNoBid !== null) {
+        log('INFO', `${coin} orderbook | YES bid:${topYesBid}¢ (${topYesSize} contracts) | NO bid:${topNoBid}¢ (${topNoSize} contracts)`);
+      }
 
+      // Detect tradeable signal:
+      // If there's active bidding on YES or NO, we copy it
+      // Use strong bid (>10¢, >5 contracts) as signal someone is confident
+      const MIN_SIZE = parseFloat(process.env.MIN_COPY_SIZE) || 1;
+
+      if(topYesBid !== null && topYesBid >= CONFIG.MIN_COPY_PRICE*100 && topYesBid <= CONFIG.MAX_COPY_PRICE*100 && topYesSize >= MIN_SIZE) {
+        // Create a synthetic trade event for YES
         await onKalshiTrade({
-          ...t,
           market_ticker: market.ticker,
-          yes_price:     yesPriceCents,
-          no_price:      noPriceCents,
+          member_id:     `orderbook-${coin}-yes`,
+          yes_price:     topYesBid,
+          no_price:      null,
+          count:         topYesSize,
           action:        'buy',
+          created_time:  new Date().toISOString(),
+        });
+      } else if(topNoBid !== null && topNoBid >= CONFIG.MIN_COPY_PRICE*100 && topNoBid <= CONFIG.MAX_COPY_PRICE*100 && topNoSize >= MIN_SIZE) {
+        // Create a synthetic trade event for NO
+        await onKalshiTrade({
+          market_ticker: market.ticker,
+          member_id:     `orderbook-${coin}-no`,
+          yes_price:     null,
+          no_price:      topNoBid,
+          count:         topNoSize,
+          action:        'buy',
+          created_time:  new Date().toISOString(),
         });
       }
+
     } catch(e) {
       log('WARN', `pollKalshiTrades(${coin}): ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 200));
   }
 }
-pollKalshiTrades._logged = false;
 
 // ── SETTLE OPEN TRADES ────────────────────────────────────────
 // Check if any of our open trades have resolved and calculate PnL
