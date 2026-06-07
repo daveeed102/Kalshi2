@@ -669,24 +669,45 @@ async function main() {
     alertedThisWindow.clear();
   }, 5 * 60 * 1000);
 
-  // Also poll every 60s as fallback (catches trades WS missed)
+  // ── ADAPTIVE POLLING ─────────────────────────────────────────
+  // Outside alert window: poll every 30s (light touch)
+  // Inside alert window: poll every 10s (aggressive — catch signals fast)
+  // This is the core loop that detects trader activity
+
+  let lastPollTime = 0;
+
   setInterval(async () => {
-    if(wsMarkets.length > 0) {
-      await pollRecentTrades(wsMarkets);
-    }
-  }, 60 * 1000);
+    const inWindow  = inKalshiAlertWindow();
+    const secsLeft  = secsToNextSettlement();
+    const interval  = inWindow ? 10 : 30; // 10s in window, 30s outside
+    const now       = Date.now();
 
-  // Status log every 5min
-  setInterval(() => {
-    const secsLeft = secsToNextSettlement();
-    const inWindow = inKalshiAlertWindow();
-    log('INFO', `Status | Next settlement: ${nextSettlementTime()} (${secsLeft}s) | In alert window: ${inWindow} | Kalshi markets: ${kalshiMarkets.size}`);
+    if((now - lastPollTime) < interval * 1000) return; // not time yet
+    lastPollTime = now;
 
-    // Log current signal states
-    for(const [key, state] of signalState) {
-      if(state.traders.size > 0) {
-        log('INFO', `  Signal state: ${key} = ${state.traders.size} traders`);
+    // Poll top traders for recent trades
+    await pollRecentTrades(wsMarkets);
+
+    // Log status every check when in window, every 5min outside
+    if(inWindow) {
+      log('INFO', `⏰ IN WINDOW | ${secsLeft}s to ${nextSettlementTime()} | Kalshi markets: ${kalshiMarkets.size}`);
+      // Log signal states so you can see progress
+      let hasState = false;
+      for(const [key, st] of signalState) {
+        if(st.traders.size > 0) {
+          log('INFO', `  📊 ${key}: ${st.traders.size}/${CONFIG.minTraders} traders`);
+          hasState = true;
+        }
       }
+      if(!hasState) log('INFO', `  No trader signals yet this window`);
+    }
+  }, 5000); // run check every 5s, but interval logic controls actual poll frequency
+
+  // Status log every 5min (outside window summary)
+  setInterval(() => {
+    if(!inKalshiAlertWindow()) {
+      const secsLeft = secsToNextSettlement();
+      log('INFO', `Status | Next window: ${nextSettlementTime()} in ${Math.floor(secsLeft/60)}m${secsLeft%60}s | Kalshi: ${kalshiMarkets.size} markets`);
     }
   }, 5 * 60 * 1000);
 
