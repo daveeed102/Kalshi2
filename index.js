@@ -391,9 +391,12 @@ async function findPolyMarkets() {
   // Strategy 1: GET /markets directly — returns array of market objects
   // Each has clobTokenIds[0]=YES, clobTokenIds[1]=NO
   const urls = [
-    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=500&order=volume24hr&ascending=false`,
-    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=500`,
-    `${CONFIG.POLY_GAMMA}/events?active=true&closed=false&limit=200`,
+    // Search specifically for "up or down" crypto markets by keyword
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=100&search=bitcoin+up+or+down`,
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=100&search=ethereum+up+or+down`,
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=100&search=solana+up+or+down`,
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=100&search=xrp+up+or+down`,
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=100&search=dogecoin+up+or+down`,
   ];
 
   let found = 0;
@@ -463,14 +466,11 @@ async function findPolyMarkets() {
         found++;
       }
 
-      if(found > 0) {
-        log('INFO', `Found ${found} Polymarket 5-min crypto markets`);
-        return; // success — don't try other URLs
-      }
+      // Don't return early — search all coin-specific URLs
     } catch(e) { log('WARN', `findPolyMarkets(${url}): ${e.message}`); }
   }
 
-  log('WARN', `Found 0 markets — Polymarket API may be returning unexpected format`);
+  log('INFO', `Total: found ${found} Polymarket 5-min crypto markets across all searches`);
 }
 
 // ── POLYMARKET WEBSOCKET ──────────────────────────────────────
