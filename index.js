@@ -1,699 +1,600 @@
 // ============================================================
-// POLYMARKET → KALSHI SIGNAL BOT (flat single-file version)
-// All modules merged — drop index.js + package.json in root
+// POLYMARKET → KALSHI SIGNAL BOT v2
+// Watches Polymarket 5-min crypto markets via WebSocket
+// Detects when 2+ top-100 traders buy the same side
+// Alerts you to copy on Kalshi during the last 5 min window
 // ============================================================
 require('dotenv').config();
-const fs      = require('fs');
-const path    = require('path');
-const cron    = require('node-cron');
-const fetch   = require('node-fetch');
-const express = require('express');
-const Fuse    = require('fuse.js');
-const { v4: uuidv4 } = require('uuid');
-const Database = require('better-sqlite3');
+const fs        = require('fs');
+const path      = require('path');
+const fetch     = require('node-fetch');
+const WebSocket = require('ws');
+const Database  = require('better-sqlite3');
 
 // ── CONFIG ────────────────────────────────────────────────────
 const CONFIG = {
-  kalshi: {
-    apiKey:    process.env.KALSHI_API_KEY    || '',
-    apiSecret: process.env.KALSHI_API_SECRET || '',
-    baseUrl:   process.env.KALSHI_BASE_URL   || 'https://trading-api.kalshi.com',
-  },
-  discord: {
-    webhook: process.env.DISCORD_WEBHOOK_URL || '',
-  },
-  signal: {
-    timeWindowMinutes: parseInt(process.env.TIME_WINDOW_MINUTES)   || 15,
-    minTraders:        parseInt(process.env.MIN_TRADERS_FOR_SIGNAL) || 2,
-    matchThreshold:    parseInt(process.env.KALSHI_MATCH_THRESHOLD) || 70,
-    leaderboardSize:   parseInt(process.env.LEADERBOARD_SIZE)       || 150,
-  },
-  polling: {
-    tradesMinutes:    parseInt(process.env.POLL_TRADES_MINUTES)    || 5,
-    leaderboardHours: parseInt(process.env.POLL_LEADERBOARD_HOURS) || 6,
-  },
-  dashboard: {
-    port: parseInt(process.env.PORT || process.env.DASHBOARD_PORT) || 3000,
-  },
+  discord:   process.env.DISCORD_WEBHOOK_URL || '',
+  kalshiKey: process.env.KALSHI_API_KEY      || '',
+  kalshiUrl: process.env.KALSHI_BASE_URL     || 'https://trading-api.kalshi.com',
+
+  // Signal rules
+  minTraders:      parseInt(process.env.MIN_TRADERS)      || 2,   // 2+ traders to signal
+  windowSecs:      parseInt(process.env.WINDOW_SECS)      || 300, // 5 min window
+  minTradeUsd:     parseFloat(process.env.MIN_TRADE_USD)  || 10,  // ignore tiny trades
+  kalshiWindowMin: parseInt(process.env.KALSHI_WINDOW_MIN)|| 5,   // alert in last N min
+
+  // Polymarket
+  POLY_WS:   'wss://ws-subscriptions-clob.polymarket.com/ws/market',
+  POLY_REST: 'https://gamma-api.polymarket.com',
+  CLOB_REST: 'https://clob.polymarket.com',
+
+  // Coins to watch
+  COINS: ['BTC','ETH','SOL','XRP','DOGE','BNB','HYPE'],
 };
 
+// ── TOP 100 TRADERS (from predicts.guru crypto leaderboard) ──
+// These are the actual Polymarket proxy wallet addresses
+// of the top traders by volume/profit in crypto markets
+const TOP_TRADERS = new Set([
+  // From predicts.guru leaderboard - top 50 by volume
+  "0xe9076a87c5ed90ef16e6fe6529c943baeca0cff6",
+  "0xa7a8c1fd4bfff08ea30214efa7efaf75d7c6580c",
+  "0xb687f00464e33934f5d591f224e71c3559ecaee5",
+  "0xbddf61af533ff524d27154e589d2d7a81510c684",
+  "0x08fff5b9a79576a7c6e18a9d05ece0658a34ba79",
+  "0xdf17f4a8dd01a4cfa6fc3da323a2baee5f8697d1",
+  "0x6480542954b70a674a74bd1a6015dec362dc8dc5",
+  "0xfe787d2da716d60e8acff57fb87eb13cd4d10319",
+  "0x59aed45d6b8c0a4fc67af69a371007b3cceb22d5",
+  "0x204f72f35326db932158cba6adff0b9a1da95e14",
+  "0x2c335066fe58fe9237c3d3dc7b275c2a034a0563",
+  "0x5bb0de4e97698184ead80c80cb17a26cd6f6814b",
+  "0x55eca3687ea7d69632ffe0f297ea3d5158bb8c7d",
+  "0x84cfffc3f16dcc353094de30d4a45226eccd2f63",
+  "0x5d189e816b4149be00977c1a3c8840374aec4972",
+  "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
+  "0x9501ec3b8b3e330ae593ebe5b071c3d11b648223",
+  "0xa5ea13a81d2b7e8e424b182bdc1db08e756bd96a",
+  "0x1521b47bf0c41f6b7fd3ad41cdec566812c8f23e",
+  "0x02e7f29f3e612a95a9ccca7131ce7dd5d56b59e5",
+  "0xee3ecc39c41e8a6b5399b1cd1b03d72f5271ebb5",
+  "0x5268527977f700f9bf9b6d5cd843859e4e70135d",
+  "0xfedc381bf3fb5d20433bb4a0216b15dbbc5c6398",
+  "0xed107a85a4585a381e48c7f7ca4144909e7dd2e5",
+  "0x4099db7f2d394449ccf89c8d42260ecaf1d79fb8",
+  "0xc8ab97a9089a9ff7e6ef0688e6e591a066946418",
+  "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+  "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+  "0x9097b9fd27dd69aa8170e1b16f1b8b839ad70ef0",
+  "0xf284ad6d607f777f34bc643cea587c33a886b9f9",
+  "0x4f29e103339919c4baaea2a60195cf1c8bb27a7e",
+  "0x2663daca3cecf3767ca1c3b126002a8578a8ed1f",
+  "0xf8831548531d56ad6a4331493243c447a827cd1f",
+  "0xcbba64cddd05171925ffd05d8f8abd38c83fdbff",
+  "0x06dc51826bc524d9a83770e7de9dd7e005b04524",
+  "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+  "0xc21ea96be762bb55041529af6e386e7c53b80215",
+  "0x45bc74efa620b45c02308acaecdff1f7c06f978b",
+  "0xa8b202e6e9a4c2091b6860f1f5c9e9119bbc9a39",
+  "0x43e98f912cd6ddadaad88d3297e78c0648e688e5",
+  "0x99f0d31fdced5b3a0e5ee2867730a6644a6c9495",
+  "0x482bf5accdecfaffa67c14d4d4fbb59f428a3266",
+  "0xf5198df69e13937a40d1c76d6f72d9aa067d906b",
+  "0xa61ef8773ec2e821962306ca87d4b57e39ff0abd",
+  "0x1136368d7f6728e94ed14c532ab95a932f710c2e",
+  "0xf4145f880b6e3b099cc7b457e5ef3dbfeb192cd9",
+  "0x18469a63386b393ae4bbc6b74621ffe36b81a932",
+  "0x70d94a4ff67ed919a8480885cf0808afefe7a684",
+  "0xb00a5f0e2718c3ba1c502a55894db64688b477f1",
+  "0x672f13d830d3617efea21c2ec7f4bda5d2c27fcc",
+  // Extra addresses from TRADER_ADDRESSES env var added at runtime
+]);
+
 // ── LOGGER ────────────────────────────────────────────────────
-const LOG_DIR  = path.join(__dirname, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'signals.log');
-fs.mkdirSync(LOG_DIR, { recursive: true });
-
-const ICONS = { INFO:'📡',SIGNAL:'🎯',MATCH:'🔗',SKIP:'⏭',ERROR:'❌',WARN:'⚠️',POLL:'🔄',DASH:'📊' };
-
-function log(level, msg, data={}) {
-  const ts   = new Date().toISOString();
-  const icon = ICONS[level] || '📋';
-  const ext  = Object.keys(data).length ? ' ' + JSON.stringify(data) : '';
-  const line = `[${ts}] ${icon} [${level}] ${msg}${ext}`;
+fs.mkdirSync(path.join(__dirname,'logs'), { recursive:true });
+const logFile = path.join(__dirname,'logs','bot.log');
+function log(level, msg) {
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
   console.log(line);
-  fs.appendFileSync(LOG_FILE, line + '\n');
+  fs.appendFileSync(logFile, line+'\n');
 }
 
 // ── DATABASE ──────────────────────────────────────────────────
-const DB_PATH = path.join(__dirname, 'data', 'bot.db');
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-
-const db = new Database(DB_PATH);
+fs.mkdirSync(path.join(__dirname,'data'), { recursive:true });
+const db = new Database(path.join(__dirname,'data','signals.db'));
 db.pragma('journal_mode = WAL');
-
 db.exec(`
-  CREATE TABLE IF NOT EXISTS traders (
-    id TEXT PRIMARY KEY, rank INTEGER,
-    profit_30d REAL, volume_30d REAL, fetched_at INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS trades (
-    id TEXT PRIMARY KEY, trader_address TEXT,
-    market_id TEXT, market_title TEXT,
-    outcome TEXT, side TEXT,
-    price REAL, size REAL, usd_value REAL, timestamp INTEGER,
-    created_at INTEGER DEFAULT (strftime('%s','now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
-  CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader_address);
   CREATE TABLE IF NOT EXISTS signals (
-    id TEXT PRIMARY KEY, market_id TEXT, market_title TEXT,
-    outcome TEXT, traders TEXT, trader_count INTEGER,
-    avg_price REAL, window_minutes INTEGER, detected_at INTEGER,
-    kalshi_ticker TEXT, kalshi_title TEXT,
-    kalshi_confidence REAL, kalshi_price REAL,
-    status TEXT DEFAULT 'PENDING', skip_reason TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    coin TEXT, side TEXT,
+    traders TEXT, trader_count INTEGER,
+    kalshi_ticker TEXT, kalshi_price REAL,
+    fired_at INTEGER, window_end INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS trades_seen (
+    id TEXT PRIMARY KEY,
+    trader TEXT, coin TEXT, side TEXT,
+    price REAL, size_usd REAL, ts INTEGER
   );
 `);
 
-const DB = {
-  upsertTrader: db.prepare(`INSERT OR REPLACE INTO traders (id,rank,profit_30d,volume_30d,fetched_at) VALUES (@id,@rank,@profit_30d,@volume_30d,@fetched_at)`),
-  getTopTraders: db.prepare(`SELECT * FROM traders ORDER BY rank ASC LIMIT ?`),
-  upsertTrade: db.prepare(`INSERT OR IGNORE INTO trades (id,trader_address,market_id,market_title,outcome,side,price,size,usd_value,timestamp) VALUES (@id,@trader_address,@market_id,@market_title,@outcome,@side,@price,@size,@usd_value,@timestamp)`),
-  getRecentBuys: db.prepare(`SELECT * FROM trades WHERE side='BUY' AND timestamp>? ORDER BY timestamp DESC`),
-  insertSignal: db.prepare(`INSERT OR IGNORE INTO signals (id,market_id,market_title,outcome,traders,trader_count,avg_price,window_minutes,detected_at,status) VALUES (@id,@market_id,@market_title,@outcome,@traders,@trader_count,@avg_price,@window_minutes,@detected_at,@status)`),
-  updateSignal: db.prepare(`UPDATE signals SET kalshi_ticker=@kalshi_ticker,kalshi_title=@kalshi_title,kalshi_confidence=@kalshi_confidence,kalshi_price=@kalshi_price,status=@status,skip_reason=@skip_reason WHERE id=@id`),
-  getRecentSignals: db.prepare(`SELECT * FROM signals ORDER BY detected_at DESC LIMIT ?`),
-  signalExists: db.prepare(`SELECT id FROM signals WHERE market_id=? AND outcome=? AND detected_at>? LIMIT 1`),
-  bulkTraders: (list) => { const tx = db.transaction(l => { for(const t of l) DB.upsertTrader.run(t); }); tx(list); },
-  bulkTrades:  (list) => { const tx = db.transaction(l => { for(const t of l) DB.upsertTrade.run(t); }); tx(list); },
-};
+const insertSignal = db.prepare(`
+  INSERT INTO signals (coin,side,traders,trader_count,kalshi_ticker,kalshi_price,fired_at,window_end)
+  VALUES (@coin,@side,@traders,@trader_count,@kalshi_ticker,@kalshi_price,@fired_at,@window_end)
+`);
+const insertTrade = db.prepare(`
+  INSERT OR IGNORE INTO trades_seen (id,trader,coin,side,price,size_usd,ts)
+  VALUES (@id,@trader,@coin,@side,@price,@size_usd,@ts)
+`);
 
 // ── DISCORD ───────────────────────────────────────────────────
 async function discord(msg) {
-  if(!CONFIG.discord.webhook) return;
+  if(!CONFIG.discord) return;
   try {
-    await fetch(CONFIG.discord.webhook, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    await fetch(CONFIG.discord, {
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ content: msg.slice(0,1990) }),
     });
-  } catch(e) { log('ERROR', `Discord: ${e.message}`); }
+  } catch(e) { log('ERROR',`Discord: ${e.message}`); }
 }
 
-// ── POLYMARKET ────────────────────────────────────────────────
-const GAMMA = 'https://gamma-api.polymarket.com';
-const CLOB  = 'https://clob.polymarket.com';
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// ── SIGNAL STATE ──────────────────────────────────────────────
+// key: "BTC::YES" → { traders: Set, firstSeen: ts, lastAlerted: ts }
+const signalState = new Map();
+const alertedThisWindow = new Set(); // prevent duplicate alerts per window
 
-// ── HARDCODED SEED TRADERS ───────────────────────────────────
-// Top crypto traders from polymarket.com/leaderboard?category=crypto
-// Bot tries to fetch live list, falls back to these known addresses
-// Update periodically by checking polymarket.com/leaderboard
-const SEED_TRADERS = [
-  // These are the proxy wallet addresses shown on Polymarket leaderboard
-  // Format: address scraped from leaderboard page profiles
-  // The bot will attempt to fetch live leaderboard and update these
-].map((id, i) => ({ id, rank: i+1, profit_30d: 0, volume_30d: 0, fetched_at: Math.floor(Date.now()/1000) }));
+// ── KALSHI WINDOW DETECTION ───────────────────────────────────
+// Returns true if we're in the last N minutes before a :00/:15/:30/:45
+function inKalshiAlertWindow() {
+  const now     = new Date();
+  const minutes = now.getMinutes();
+  const secs    = now.getSeconds();
+  const mod     = minutes % 15; // 0-14, where 0=settlement, 10-14=alert window
+  const totalSecs = mod * 60 + secs;
+  const windowStart = (15 - CONFIG.kalshiWindowMin) * 60; // e.g. 10:00 for 5min window
+  return totalSecs >= windowStart;
+}
 
-async function fetchLeaderboard() {
+// Returns seconds until next Kalshi settlement
+function secsToNextSettlement() {
+  const now   = new Date();
+  const mod   = now.getMinutes() % 15;
+  const secs  = now.getSeconds();
+  return (15 - mod) * 60 - secs;
+}
+
+// Returns the next settlement time string e.g. "1:15 PM"
+function nextSettlementTime() {
+  const now  = new Date();
+  const mod  = now.getMinutes() % 15;
+  const next = new Date(now.getTime() + secsToNextSettlement()*1000);
+  return next.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+}
+
+// ── KALSHI MARKET LOOKUP ──────────────────────────────────────
+const kalshiCache = new Map(); // coin → { ticker, price, title }
+
+async function fetchKalshiMarket(coin) {
+  if(!CONFIG.kalshiKey) return null;
   try {
-    log('POLL', 'Fetching Polymarket leaderboard...');
-
-    // Strategy 1: Polymarket GraphQL (most reliable)
-    try {
-      const gql = await fetch('https://gamma-api.polymarket.com/profiles?limit=150&sortBy=profit&window=monthly', {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (compatible; bot/1.0)',
-          'Origin': 'https://polymarket.com',
-          'Referer': 'https://polymarket.com/',
-        }
-      });
-      if(gql.ok) {
-        const data = await gql.json();
-        const raw  = extractArray(data);
-        if(raw?.length > 0) {
-          log('POLL', `Profiles endpoint: ${raw.length} traders`);
-          return processLeaderboard(raw);
-        }
-      }
-    } catch(e) { log('WARN', `Profiles endpoint: ${e.message}`); }
-
-    // Strategy 2: CLOB leaderboard
-    const clobUrls = [
-      `${CLOB}/profiles/leaderboard?window=monthly&limit=150`,
-      `${CLOB}/leaderboard?window=monthly&limit=150`,
-    ];
-    for(const url of clobUrls) {
-      try {
-        const r = await fetch(url, {
-          headers: {
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0',
-          }
-        });
-        if(!r.ok) continue;
-        const data = await r.json();
-        const raw  = extractArray(data);
-        if(raw?.length > 0) {
-          log('POLL', `CLOB leaderboard: ${raw.length} traders`);
-          return processLeaderboard(raw);
-        }
-      } catch(e) { log('WARN', `CLOB: ${e.message}`); }
-    }
-
-    // Strategy 3: Gamma leaderboard with various params
-    const gammaUrls = [
-      `${GAMMA}/leaderboard?window=monthly&limit=150`,
-      `${GAMMA}/leaderboard?window=1m&limit=150`,
-      `${GAMMA}/leaderboard?timeframe=monthly&limit=150`,
-    ];
-    for(const url of gammaUrls) {
-      try {
-        const r = await fetch(url, { headers:{ 'Accept':'application/json','User-Agent':'Mozilla/5.0' } });
-        if(!r.ok) continue;
-        const data = await r.json();
-        const raw  = extractArray(data);
-        if(raw?.length > 0) {
-          log('POLL', `Gamma: ${raw.length} traders`);
-          return processLeaderboard(raw);
-        }
-      } catch(e) { log('WARN', `Gamma: ${e.message}`); }
-    }
-
-    // Strategy 4: Use seed traders if we have them configured
-    if(process.env.TRADER_ADDRESSES) {
-      log('POLL', 'Using TRADER_ADDRESSES env var');
-      const addrs = process.env.TRADER_ADDRESSES.split(',').map(a=>a.trim()).filter(Boolean);
-      const traders = addrs.map((id,i) => ({
-        id, rank:i+1, profit_30d:0, volume_30d:0,
-        fetched_at: Math.floor(Date.now()/1000)
-      }));
-      DB.bulkTraders(traders);
-      log('POLL', `Loaded ${traders.length} traders from TRADER_ADDRESSES`);
-      return traders;
-    }
-
-    // Strategy 5: Use existing DB traders if any
-    const existing = DB.getTopTraders.all(150);
-    if(existing.length > 0) {
-      log('POLL', `Using ${existing.length} cached traders from DB`);
-      return existing;
-    }
-
-    log('WARN', 'No traders available — add wallet addresses to TRADER_ADDRESSES env var');
-    log('WARN', 'Example: TRADER_ADDRESSES=0xabc...,0xdef...,0x123...');
-    return [];
-  } catch(e) {
-    log('ERROR', `fetchLeaderboard: ${e.message}`);
-    return [];
-  }
-}
-
-function extractArray(data) {
-  if(Array.isArray(data) && data.length > 0)           return data;
-  if(Array.isArray(data?.data) && data.data.length > 0) return data.data;
-  if(Array.isArray(data?.results))                      return data.results;
-  if(Array.isArray(data?.leaderboard))                  return data.leaderboard;
-  if(Array.isArray(data?.profiles))                     return data.profiles;
-  for(const v of Object.values(data||{})) {
-    if(Array.isArray(v) && v.length > 0) return v;
-  }
-  return null;
-}
-
-function processLeaderboard(raw) {
-  const traders = raw.map((t,i) => ({
-    id:         t.proxyWalletAddress || t.address || t.user || '',
-    rank:       t.rank || i+1,
-    profit_30d: parseFloat(t.pnl || t.profit || 0),
-    volume_30d: parseFloat(t.volume || 0),
-    fetched_at: Math.floor(Date.now()/1000),
-  })).filter(t => t.id);
-  DB.bulkTraders(traders);
-  log('POLL', `Leaderboard: ${traders.length} traders stored`);
-  return traders;
-}
-
-async function fetchTraderTrades(address) {
-  try {
-    const r = await fetch(`${CLOB}/trades?user=${address}&limit=50`);
-    if(!r.ok) return [];
-    const data   = await r.json();
-    const trades = data?.data || data || [];
-    // Crypto keywords — only track crypto markets
-    const CRYPTO_KEYWORDS = [
-      'btc','bitcoin','eth','ethereum','sol','solana','xrp','ripple',
-      'doge','dogecoin','bnb','binance','hype','hyperliquid','avax',
-      'avalanche','link','chainlink','matic','polygon','ada','cardano',
-      'crypto','price','above','below','higher','lower','15 min','15min',
-    ];
-    const isCrypto = t => {
-      const title = (t.title||t.market_title||'').toLowerCase();
-      return CRYPTO_KEYWORDS.some(k => title.includes(k));
-    };
-
-    return trades
-      .filter(isCrypto)
-      .map(t => ({
-        id:             t.id || `${address}-${t.timestamp}-${Math.random()}`,
-        trader_address: address,
-        market_id:      t.market || t.marketId || t.condition_id || '',
-        market_title:   t.title  || t.market_title || '',
-        outcome:        t.outcome_index===0 ? 'YES' : t.outcome_index===1 ? 'NO' : (t.outcome||'YES'),
-        side:           (t.side||t.type||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL',
-        price:          parseFloat(t.price||0),
-        size:           parseFloat(t.size||t.matched||0),
-        usd_value:      parseFloat(t.usdcSize || (parseFloat(t.price||0)*parseFloat(t.size||0))),
-        timestamp:      t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : Math.floor(Date.now()/1000),
-      }));
-  } catch(e) { return []; }
-}
-
-async function pollAllTraders() {
-  const traders = DB.getTopTraders.all(CONFIG.signal.leaderboardSize);
-  if(!traders.length){ log('WARN','No traders in DB'); return 0; }
-  log('POLL', `Polling ${traders.length} traders...`);
-  let total = 0;
-  for(const t of traders) {
-    const trades = await fetchTraderTrades(t.id);
-    if(trades.length) { DB.bulkTrades(trades); total += trades.length; }
-    await sleep(200);
-  }
-  log('POLL', `Poll done — ${total} trades stored`);
-  return total;
-}
-
-// ── SIGNAL DETECTION ──────────────────────────────────────────
-function detectSignals() {
-  const windowSecs = CONFIG.signal.timeWindowMinutes * 60;
-  const cutoff     = Math.floor(Date.now()/1000) - windowSecs;
-  const recentBuys = DB.getRecentBuys.all(cutoff);
-  if(!recentBuys.length) return [];
-
-  const topTraders = new Set(DB.getTopTraders.all(CONFIG.signal.leaderboardSize).map(t=>t.id));
-  const topBuys    = recentBuys.filter(t => topTraders.has(t.trader_address));
-  if(!topBuys.length) return [];
-
-  // Group by market_id + outcome
-  const byMarket = new Map();
-  for(const trade of topBuys) {
-    const key = `${trade.market_id}::${trade.outcome}`;
-    if(!byMarket.has(key)) byMarket.set(key, []);
-    byMarket.get(key).push(trade);
-  }
-
-  // Fuzzy cluster by title
-  const titled  = topBuys.filter(t => t.market_title && t.market_title.length > 5);
-  const fuse    = new Fuse(titled, { keys:['market_title'], threshold:0.3, includeScore:true });
-  const seen    = new Set();
-  for(const trade of titled) {
-    if(seen.has(trade.id)) continue;
-    const matches = fuse.search(trade.market_title)
-      .filter(r => r.score < 0.3 && r.item.id !== trade.id && r.item.outcome === trade.outcome)
-      .map(r => r.item);
-    if(matches.length) {
-      const key = `title::${trade.market_title}::${trade.outcome}`;
-      byMarket.set(key, [trade, ...matches]);
-      [trade, ...matches].forEach(m => seen.add(m.id));
-    }
-  }
-
-  const newSignals = [];
-  for(const [, trades] of byMarket) {
-    const byTrader = new Map();
-    for(const t of trades) if(!byTrader.has(t.trader_address)) byTrader.set(t.trader_address, t);
-    const unique = [...byTrader.values()];
-    if(unique.length < CONFIG.signal.minTraders) continue;
-
-    const best     = unique.reduce((a,b) => b.usd_value > a.usd_value ? b : a);
-    // Dedup: skip if we already signaled this market+outcome in last 4 hours
-    const existing = DB.signalExists.get(best.market_id, best.outcome, Math.floor(Date.now()/1000)-14400);
-    if(existing) {
-      log('SKIP', `Already signaled "${best.market_title?.slice(0,40)}" ${best.outcome} in last 4h`);
-      continue;
-    }
-
-    // Also skip if title is too similar to a recent signal (catches same market with different ID)
-    const recentSigs = DB.getRecentSignals.all(20);
-    const titleDup = recentSigs.some(s => {
-      if((Math.floor(Date.now()/1000) - s.detected_at) > 14400) return false; // older than 4h
-      if(s.outcome !== best.outcome) return false;
-      const a = (s.market_title||'').toLowerCase();
-      const b = (best.market_title||'').toLowerCase();
-      // Check if they share 3+ words
-      const aWords = a.split(/\W+/).filter(w=>w.length>3);
-      const bWords = b.split(/\W+/).filter(w=>w.length>3);
-      const shared = aWords.filter(w=>bWords.includes(w)).length;
-      return shared >= 3;
-    });
-    if(titleDup) {
-      log('SKIP', `Similar signal already sent recently for "${best.market_title?.slice(0,40)}"`);
-      continue;
-    }
-
-    const avgPrice = unique.reduce((s,t)=>s+t.price,0)/unique.length;
-    const signal   = {
-      id:             uuidv4(),
-      market_id:      best.market_id,
-      market_title:   best.market_title || best.market_id,
-      outcome:        best.outcome,
-      traders:        JSON.stringify(unique.map(t=>t.trader_address)),
-      trader_count:   unique.length,
-      avg_price:      avgPrice,
-      window_minutes: CONFIG.signal.timeWindowMinutes,
-      detected_at:    Math.floor(Date.now()/1000),
-      status:         'PENDING',
-    };
-    DB.insertSignal.run(signal);
-    newSignals.push(signal);
-    log('SIGNAL', `"${best.market_title?.slice(0,50)}" ${best.outcome} | ${unique.length} traders | avg:${(avgPrice*100).toFixed(1)}¢`);
-  }
-  return newSignals;
-}
-
-// ── KALSHI ────────────────────────────────────────────────────
-function kalshiHeaders() {
-  return { 'Content-Type':'application/json', 'Authorization':`Bearer ${CONFIG.kalshi.apiKey}` };
-}
-
-const KALSHI_CRYPTO_TICKERS = ['BTC','ETH','SOL','XRP','DOGE','BNB','HYPE','AVAX','LINK','MATIC','ADA'];
-
-async function searchKalshi(query='', limit=100) {
-  try {
-    const params = new URLSearchParams({ limit:String(limit), status:'open' });
-    if(query) params.set('search', query);
-    const r = await fetch(`${CONFIG.kalshi.baseUrl}/trade-api/v2/markets?${params}`, { headers:kalshiHeaders() });
-    if(!r.ok) return [];
-    const d = await r.json();
-    const markets = d.markets || [];
-
-    // Only return 15-minute crypto markets
-    return markets.filter(m => {
-      const title = (m.title||m.subtitle||'').toUpperCase();
-      const isCrypto = KALSHI_CRYPTO_TICKERS.some(t => title.includes(t));
-      const is15min  = title.includes('15') || (m.ticker||'').includes('15');
-      return isCrypto && is15min;
-    });
-  } catch(e) { return []; }
-}
-
-async function fetchAllKalshi15minMarkets() {
-  // Fetch all open 15min crypto Kalshi markets upfront
-  const all = [];
-  for(const coin of KALSHI_CRYPTO_TICKERS) {
-    const markets = await searchKalshi(coin, 50);
-    all.push(...markets);
-    await sleep(100);
-  }
-  // Deduplicate by ticker
-  const seen = new Set();
-  return all.filter(m => { if(seen.has(m.ticker)) return false; seen.add(m.ticker); return true; });
-}
-
-async function getKalshiMarket(ticker) {
-  try {
-    const r = await fetch(`${CONFIG.kalshi.baseUrl}/trade-api/v2/markets/${ticker}`, { headers:kalshiHeaders() });
+    const r = await fetch(
+      `${CONFIG.kalshiUrl}/trade-api/v2/markets?status=open&search=${coin}+15&limit=50`,
+      { headers:{ 'Authorization':`Bearer ${CONFIG.kalshiKey}`, 'Accept':'application/json' } }
+    );
     if(!r.ok) return null;
     const d = await r.json();
-    return d.market || null;
-  } catch(e) { return null; }
-}
-
-function scoreMatch(polyTitle, polyOutcome, km) {
-  let score  = 0;
-  const kT   = (km.title||'').toLowerCase();
-  const kSub = (km.subtitle||'').toLowerCase();
-  const pT   = (polyTitle||'').toLowerCase();
-
-  const fuse = new Fuse([{t:kT}], {keys:['t'], threshold:0.4, includeScore:true});
-  const res  = fuse.search(pT);
-  if(res.length) score += Math.round((1-(res[0].score||1))*40);
-
-  const pWords = pT.split(/\W+/).filter(w=>w.length>3);
-  const kWords = (kT+' '+kSub).split(/\W+/).filter(w=>w.length>3);
-  const overlap = pWords.filter(w=>kWords.includes(w)).length;
-  score += pWords.length ? Math.round((overlap/pWords.length)*20) : 0;
-
-  const CATS = {
-    politics: ['election','president','vote','trump','biden','harris','congress'],
-    crypto:   ['bitcoin','btc','eth','crypto','sol','solana'],
-    sports:   ['nfl','nba','mlb','nhl','super bowl','championship'],
-    finance:  ['fed','interest rate','inflation','gdp','recession'],
-    ai:       ['openai','gpt','claude','artificial intelligence'],
-  };
-  let pCat=null, kCat=null;
-  for(const [cat,words] of Object.entries(CATS)){
-    if(words.some(w=>pT.includes(w)))          pCat=cat;
-    if(words.some(w=>kT.includes(w)||kSub.includes(w))) kCat=cat;
-  }
-  if(pCat&&kCat&&pCat===kCat) score+=20;
-  if(km.yes_bid||km.yes_ask)  score+=20;
-
-  return Math.min(score,100);
-}
-
-async function findKalshiMatch(signal) {
-  const keywords = (signal.market_title||'')
-    .replace(/[^a-zA-Z0-9 ]/g,' ').split(' ')
-    .filter(w=>w.length>3).slice(0,3).join(' ');
-
-  if(!keywords) return null;
-  log('MATCH', `Searching Kalshi 15min crypto: "${keywords}"`);
-
-  const markets = await searchKalshi(keywords);
-  if(!markets.length) {
-    log('SKIP', `No 15min crypto Kalshi markets for: "${keywords}"`);
-    return null;
-  }
-
-  const scored = markets
-    .map(m => ({ market:m, confidence:scoreMatch(signal.market_title, signal.outcome, m) }))
-    .sort((a,b) => b.confidence-a.confidence);
-
-  const best = scored[0];
-  log('MATCH', `Best: "${best.market.title?.slice(0,50)}" | ${best.confidence}/100 | ${best.market.ticker}`);
-
-  if(best.confidence < CONFIG.signal.matchThreshold) {
-    log('SKIP', `Confidence ${best.confidence} < ${CONFIG.signal.matchThreshold}`);
-    return null;
-  }
-
-  const detail   = await getKalshiMarket(best.market.ticker);
-  const yesPrice = detail?.yes_ask || detail?.last_price || 0;
-
-  return { ticker:best.market.ticker, title:best.market.title, confidence:best.confidence, yesPrice, noPrice:detail?.no_ask||(1-yesPrice) };
-}
-
-// ── ALERT ─────────────────────────────────────────────────────
-async function alertSignal(signal, match) {
-  const traders = JSON.parse(signal.traders||'[]');
-  const avgPct  = (signal.avg_price*100).toFixed(1);
-
-  const msg = [
-    `🎯  **SIGNAL DETECTED**`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `📊  **Polymarket:** ${signal.market_title?.slice(0,60)}`,
-    `📈  **Outcome:** ${signal.outcome} | Avg: **${avgPct}¢**`,
-    `👥  **${traders.length}** top-50 traders agreed`,
-    `⏱   Window: **${signal.window_minutes} min**`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    match
-      ? [`🔗  **Kalshi:** ${match.title?.slice(0,60)}`,
-         `🎯  Confidence: **${match.confidence}/100**`,
-         `💰  YES price: **${(match.yesPrice*100).toFixed(1)}¢**`,
-         `📋  Ticker: \`${match.ticker}\``].join('\n')
-      : `⏭  No Kalshi match (threshold: ${CONFIG.signal.matchThreshold}/100)`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `🆔  \`${signal.id.slice(0,8)}\``,
-  ].join('\n');
-
-  await discord(msg);
-  log('SIGNAL', `Alert sent: ${signal.id.slice(0,8)}`);
-}
-
-// ── PROCESS SIGNAL ────────────────────────────────────────────
-// Track signals currently being processed to avoid duplicate alerts
-const processingSignals = new Set();
-
-async function processSignal(signal) {
-  // Skip if same market+outcome is already being processed right now
-  const key = `${signal.market_id}::${signal.outcome}`;
-  if(processingSignals.has(key)) {
-    log('SKIP', `Already processing ${key} — skipping duplicate`);
-    return;
-  }
-  processingSignals.add(key);
-
-  log('SIGNAL', `Processing: "${signal.market_title?.slice(0,50)}" | ${signal.outcome} | ${signal.trader_count} traders`);
-
-  let match = null;
-  if(CONFIG.kalshi.apiKey) {
-    match = await findKalshiMatch(signal);
-    DB.updateSignal.run({
-      id: signal.id,
-      kalshi_ticker:     match?.ticker     || null,
-      kalshi_title:      match?.title      || null,
-      kalshi_confidence: match?.confidence || null,
-      kalshi_price:      match?.yesPrice   || null,
-      status:            match ? 'MATCHED' : 'SKIPPED',
-      skip_reason:       match ? null : 'no_match',
+    const markets = (d.markets||[]).filter(m => {
+      const t = (m.title||'').toUpperCase();
+      return t.includes(coin) && (t.includes('15') || t.includes('MIN'));
     });
+    if(!markets.length) return null;
+
+    // Pick the one settling soonest
+    const best = markets[0];
+    const detail = await fetch(
+      `${CONFIG.kalshiUrl}/trade-api/v2/markets/${best.ticker}`,
+      { headers:{ 'Authorization':`Bearer ${CONFIG.kalshiKey}`, 'Accept':'application/json' } }
+    );
+    if(!detail.ok) return { ticker: best.ticker, title: best.title, price: null };
+    const dd = await detail.json();
+    return {
+      ticker: best.ticker,
+      title:  best.title,
+      price:  dd.market?.yes_ask || dd.market?.last_price || null,
+    };
+  } catch(e) {
+    log('ERROR',`Kalshi lookup ${coin}: ${e.message}`);
+    return null;
+  }
+}
+
+// ── PROCESS A TRADE ───────────────────────────────────────────
+async function processTrade(trade) {
+  const { maker, taker, asset_id, price, size, side, id, timestamp } = trade;
+
+  // Determine trader address — could be maker or taker
+  const trader = TOP_TRADERS.has(maker) ? maker
+               : TOP_TRADERS.has(taker) ? taker
+               : null;
+  if(!trader) return; // not a top trader
+
+  // Determine coin from asset context (set by market subscription)
+  const coin = trade._coin;
+  if(!coin) return;
+
+  // Parse side — on Polymarket YES buy = price > 0.5 typically
+  const tradeSide = side === 'BUY' ? 'YES' : 'NO';
+
+  // Filter tiny trades
+  const sizeUsd = parseFloat(price||0) * parseFloat(size||0) * 100;
+  if(sizeUsd < CONFIG.minTradeUsd) return;
+
+  const ts = timestamp ? Math.floor(new Date(timestamp).getTime()/1000) : Math.floor(Date.now()/1000);
+
+  // Store trade
+  insertTrade.run({ id: id||`${trader}-${ts}-${Math.random()}`, trader, coin, side:tradeSide, price:parseFloat(price||0), size_usd:sizeUsd, ts });
+
+  log('TRADE', `TOP TRADER ${trader.slice(0,10)}... | ${coin} ${tradeSide} | $${sizeUsd.toFixed(0)} @ ${(parseFloat(price||0)*100).toFixed(1)}¢`);
+
+  // Update signal state
+  const key = `${coin}::${tradeSide}`;
+  if(!signalState.has(key)) {
+    signalState.set(key, { traders: new Set(), firstSeen: ts });
+  }
+  const state = signalState.get(key);
+  state.traders.add(trader);
+  state.lastTrade = ts;
+
+  // Check for signal
+  const now = Math.floor(Date.now()/1000);
+  const age = now - state.firstSeen;
+
+  // Clean old traders (outside time window)
+  if(age > CONFIG.windowSecs) {
+    state.traders.clear();
+    state.firstSeen = ts;
+    state.traders.add(trader);
   }
 
-  await alertSignal(signal, match);
+  const traderCount = state.traders.size;
+  log('INFO', `Signal state ${key}: ${traderCount}/${CONFIG.minTraders} traders in window`);
 
-  DB.updateSignal.run({
-    id: signal.id,
-    kalshi_ticker:     match?.ticker     || null,
-    kalshi_title:      match?.title      || null,
-    kalshi_confidence: match?.confidence || null,
-    kalshi_price:      match?.yesPrice   || null,
-    status:            'ALERTED',
-    skip_reason:       null,
-  });
+  if(traderCount >= CONFIG.minTraders) {
+    // Check if in Kalshi alert window
+    if(!inKalshiAlertWindow()) {
+      log('INFO', `Signal ${key} has ${traderCount} traders but NOT in Kalshi window yet (${Math.round(secsToNextSettlement()/60)}m to settlement)`);
+      return;
+    }
 
-  // Release lock
-  processingSignals.delete(`${signal.market_id}::${signal.outcome}`);
+    // Prevent duplicate alerts for same coin+side in same Kalshi window
+    const windowKey = `${key}::${Math.floor(now/900)}`; // 900s = 15min window
+    if(alertedThisWindow.has(windowKey)) {
+      log('INFO', `Already alerted ${key} this window`);
+      return;
+    }
+    alertedThisWindow.add(windowKey);
+
+    // Fire signal!
+    await fireSignal(coin, tradeSide, state.traders, ts);
+
+    // Reset state for this pair after firing
+    state.traders.clear();
+    state.firstSeen = ts;
+  }
 }
 
-// ── POLL CYCLE ────────────────────────────────────────────────
-async function runPollCycle() {
-  try {
-    await pollAllTraders();
-    const newSignals = detectSignals();
-    log('POLL', `${newSignals.length} new signals`);
-    for(const s of newSignals) await processSignal(s);
-  } catch(e) { log('ERROR', `Poll cycle: ${e.message}`); }
-}
+// ── FIRE SIGNAL ───────────────────────────────────────────────
+async function fireSignal(coin, side, traders, ts) {
+  const secsLeft  = secsToNextSettlement();
+  const settleAt  = nextSettlementTime();
+  const traderArr = [...traders];
 
-// ── DASHBOARD ─────────────────────────────────────────────────
-function startDashboard() {
-  const app      = express();
-  const signals  = () => DB.getRecentSignals.all(20);
-  const traders  = () => DB.getTopTraders.all(10);
+  log('SIGNAL', `🎯 SIGNAL: ${coin} ${side} | ${traderArr.length} traders | ${secsLeft}s to ${settleAt}`);
 
-  app.get('/api/signals', (req,res) => res.json(DB.getRecentSignals.all(50)));
-  app.get('/api/traders', (req,res) => res.json(DB.getTopTraders.all(50)));
+  // Look up Kalshi market
+  let kalshi = kalshiCache.get(coin);
+  if(!kalshi) {
+    kalshi = await fetchKalshiMarket(coin);
+    if(kalshi) kalshiCache.set(coin, kalshi);
+  }
 
-  app.get('/', (req,res) => {
-    const sigs  = signals();
-    const trads = traders();
+  const kalshiTicker = kalshi?.ticker || `${coin}-15MIN`;
+  const kalshiPrice  = kalshi?.price  || null;
+  const kalshiTitle  = kalshi?.title  || `${coin} 15-min market`;
 
-    const sigRows = sigs.map(s=>`
-      <tr>
-        <td>${new Date(s.detected_at*1000).toLocaleTimeString()}</td>
-        <td>${(s.market_title||'').slice(0,50)}</td>
-        <td><b>${s.outcome}</b></td>
-        <td>${s.trader_count}</td>
-        <td>${((s.avg_price||0)*100).toFixed(1)}¢</td>
-        <td>${s.kalshi_ticker||'—'}</td>
-        <td>${s.kalshi_confidence?s.kalshi_confidence.toFixed(0)+'/100':'—'}</td>
-        <td>${s.kalshi_price?((s.kalshi_price)*100).toFixed(1)+'¢':'—'}</td>
-        <td><span class="b ${s.status}">${s.status}</span></td>
-      </tr>`).join('');
-
-    const tradRows = trads.map(t=>`
-      <tr>
-        <td>#${t.rank}</td>
-        <td><code>${(t.id||'').slice(0,20)}...</code></td>
-        <td>$${(t.profit_30d||0).toFixed(0)}</td>
-        <td>$${(t.volume_30d||0).toFixed(0)}</td>
-      </tr>`).join('');
-
-    res.send(`<!DOCTYPE html><html><head><title>Kalshi Signal Bot</title>
-<meta http-equiv="refresh" content="30">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;padding:20px}
-h1{color:#a78bfa;margin-bottom:4px;font-size:1.4rem}
-h2{color:#7c3aed;font-size:1rem;margin:20px 0 8px;text-transform:uppercase;letter-spacing:1px}
-.meta{color:#64748b;font-size:.8rem;margin-bottom:20px}
-.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
-.card{background:#1e1e2e;border:1px solid #2d2d3d;border-radius:8px;padding:16px 20px;min-width:140px}
-.card .val{font-size:1.6rem;font-weight:bold;color:#a78bfa}
-.card .label{font-size:.75rem;color:#64748b;margin-top:2px}
-table{width:100%;border-collapse:collapse;margin-bottom:24px;font-size:.82rem}
-th{background:#1a1a2e;color:#7c3aed;text-align:left;padding:8px 10px;border-bottom:1px solid #2d2d3d}
-td{padding:7px 10px;border-bottom:1px solid #1a1a2e}
-tr:hover td{background:#1e1e2e}
-.b{padding:2px 8px;border-radius:12px;font-size:.7rem;font-weight:bold}
-.b.PENDING{background:#374151;color:#9ca3af}
-.b.MATCHED{background:#1e3a5f;color:#60a5fa}
-.b.ALERTED{background:#3b1f6b;color:#c4b5fd}
-.b.SKIPPED{background:#2d1b1b;color:#ef4444}
-code{font-size:.78rem;color:#94a3b8}
-</style></head><body>
-<h1>📊 Polymarket → Kalshi Signal Bot</h1>
-<p class="meta">Auto-refreshes every 30s · ${new Date().toLocaleString()}</p>
-<div class="cards">
-  <div class="card"><div class="val">${sigs.length}</div><div class="label">Recent Signals</div></div>
-  <div class="card"><div class="val">${sigs.filter(s=>s.status==='ALERTED').length}</div><div class="label">Alerted</div></div>
-  <div class="card"><div class="val">${sigs.filter(s=>s.kalshi_ticker).length}</div><div class="label">Kalshi Matched</div></div>
-  <div class="card"><div class="val">${trads.length}/150</div><div class="label">Traders Tracked</div></div>
-</div>
-<h2>🎯 Recent Signals</h2>
-<table><tr><th>Time</th><th>Market</th><th>Side</th><th>Traders</th><th>Avg Price</th><th>Kalshi</th><th>Confidence</th><th>Price</th><th>Status</th></tr>
-${sigRows||'<tr><td colspan="9" style="color:#64748b;text-align:center;padding:20px">No signals yet</td></tr>'}
-</table>
-<h2>👤 Top Traders</h2>
-<table><tr><th>Rank</th><th>Address</th><th>30D Profit</th><th>30D Volume</th></tr>
-${tradRows||'<tr><td colspan="4" style="color:#64748b;text-align:center;padding:20px">No traders yet</td></tr>'}
-</table>
-</body></html>`);
+  // Store signal
+  insertSignal.run({
+    coin, side,
+    traders:      JSON.stringify(traderArr),
+    trader_count: traderArr.length,
+    kalshi_ticker: kalshiTicker,
+    kalshi_price:  kalshiPrice,
+    fired_at:      Math.floor(Date.now()/1000),
+    window_end:    Math.floor(Date.now()/1000) + secsLeft,
   });
 
-  app.listen(CONFIG.dashboard.port, () =>
-    log('DASH', `Dashboard at http://localhost:${CONFIG.dashboard.port}`)
-  );
+  // Discord alert
+  const priceStr = kalshiPrice ? `${(kalshiPrice*100).toFixed(1)}¢` : 'check app';
+  const urgency  = secsLeft < 120 ? '🚨 URGENT' : '🎯 SIGNAL';
+
+  await discord([
+    `${urgency} — **${coin} ${side}** on Kalshi`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `📊 **${traderArr.length}** top-100 Polymarket traders bought **${coin} ${side}**`,
+    `⏱  **${secsLeft}s left** before Kalshi settles at **${settleAt}**`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `🎯 **Kalshi market:** ${kalshiTitle}`,
+    `📋 **Ticker:** \`${kalshiTicker}\``,
+    `💰 **Current YES price:** ${priceStr}`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `👉 **Buy ${side} on Kalshi NOW** — ${secsLeft}s window`,
+    `🔗 https://kalshi.com/markets/${kalshiTicker.toLowerCase()}`,
+  ].join('\n'));
+
+  log('SIGNAL', `Alert fired: ${coin} ${side} → ${kalshiTicker} | ${secsLeft}s left`);
+}
+
+// ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
+async function fetchPolyMarkets() {
+  const markets = [];
+  for(const coin of CONFIG.COINS) {
+    try {
+      // Search for active 5-min markets for this coin
+      const r = await fetch(
+        `${CONFIG.POLY_REST}/markets?active=true&closed=false&tag_id=21&limit=100&search=${coin}+5+min`
+      );
+      if(!r.ok) continue;
+      const d = await r.json();
+      const raw = Array.isArray(d) ? d : (d.data || d.results || []);
+
+      for(const m of raw) {
+        const title = (m.question||m.title||'').toLowerCase();
+        const isCoin = title.includes(coin.toLowerCase());
+        const is5min = title.includes('5') && (title.includes('min') || title.includes('minute'));
+        if(isCoin && is5min && m.active !== false && !m.closed) {
+          // Get token IDs for YES outcome
+          const tokens = m.tokens || m.outcomes || [];
+          const yesToken = tokens.find(t =>
+            (t.outcome||'').toUpperCase().includes('YES') ||
+            (t.outcome||'').toUpperCase().includes('ABOVE') ||
+            (t.outcome||'').toUpperCase().includes('OVER')
+          );
+          const noToken = tokens.find(t =>
+            (t.outcome||'').toUpperCase().includes('NO') ||
+            (t.outcome||'').toUpperCase().includes('BELOW') ||
+            (t.outcome||'').toUpperCase().includes('UNDER')
+          );
+
+          if(yesToken?.token_id || m.condition_id) {
+            markets.push({
+              coin,
+              title: m.question||m.title,
+              conditionId: m.condition_id,
+              yesTokenId:  yesToken?.token_id,
+              noTokenId:   noToken?.token_id,
+              marketId:    m.id,
+            });
+            log('INFO', `Found ${coin} 5-min market: ${(m.question||m.title||'').slice(0,60)}`);
+          }
+        }
+      }
+    } catch(e) { log('ERROR', `fetchPolyMarkets ${coin}: ${e.message}`); }
+  }
+  log('INFO', `Found ${markets.length} active 5-min crypto markets on Polymarket`);
+  return markets;
+}
+
+// ── ALSO POLL RECENT TRADES (FALLBACK) ───────────────────────
+// Since WebSocket may miss some trades, also poll recent trades for top traders
+async function pollRecentTrades(markets) {
+  if(!markets.length) return;
+  const cutoff = Math.floor(Date.now()/1000) - CONFIG.windowSecs;
+
+  // Sample a subset of top traders to poll (CLOB rate limits)
+  const traders = [...TOP_TRADERS].slice(0, 20);
+
+  for(const trader of traders) {
+    try {
+      const r = await fetch(`${CONFIG.CLOB_REST}/trades?user=${trader}&limit=10`);
+      if(!r.ok) continue;
+      const d = await r.json();
+      const trades = d?.data || d || [];
+
+      for(const t of trades) {
+        const ts = t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : 0;
+        if(ts < cutoff) continue;
+
+        // Match to a known market
+        const market = markets.find(m =>
+          m.conditionId === (t.market||t.condition_id) ||
+          m.yesTokenId  === t.asset_id ||
+          m.noTokenId   === t.asset_id
+        );
+        if(!market) continue;
+
+        const side = (market.yesTokenId === t.asset_id ||
+                     (t.side||'').toUpperCase()==='BUY') ? 'YES' : 'NO';
+        const sizeUsd = parseFloat(t.price||0)*parseFloat(t.size||0)*100;
+        if(sizeUsd < CONFIG.minTradeUsd) continue;
+
+        await processTrade({
+          ...t,
+          maker:  trader,
+          taker:  trader,
+          _coin:  market.coin,
+          side:   side==='YES'?'BUY':'SELL',
+          id:     t.id||`${trader}-${ts}`,
+          timestamp: t.timestamp,
+        });
+      }
+      await new Promise(r=>setTimeout(r,150)); // rate limit
+    } catch(e) {}
+  }
+}
+
+// ── WEBSOCKET ─────────────────────────────────────────────────
+let ws = null;
+let wsMarkets = [];
+
+function connectWebSocket(markets) {
+  wsMarkets = markets;
+  log('INFO', `Connecting to Polymarket WebSocket...`);
+
+  ws = new WebSocket(CONFIG.POLY_WS);
+
+  ws.on('open', () => {
+    log('INFO', '✅ Polymarket WebSocket connected');
+
+    // Subscribe to all market token IDs
+    const assetIds = markets
+      .flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean))
+      .slice(0, 200); // WS limit
+
+    if(assetIds.length === 0) {
+      log('WARN', 'No asset IDs to subscribe to — markets may not have token IDs yet');
+      return;
+    }
+
+    ws.send(JSON.stringify({
+      auth:    {},
+      type:    'Market',
+      markets: [],
+      assets:  assetIds,
+    }));
+
+    log('INFO', `Subscribed to ${assetIds.length} market token IDs`);
+  });
+
+  ws.on('message', async (raw) => {
+    try {
+      const events = JSON.parse(raw.toString());
+      const list   = Array.isArray(events) ? events : [events];
+
+      for(const event of list) {
+        if(event.event_type !== 'trade') continue;
+
+        // Find which market this trade belongs to
+        const market = wsMarkets.find(m =>
+          m.yesTokenId === event.asset_id ||
+          m.noTokenId  === event.asset_id
+        );
+        if(!market) continue;
+
+        // Check if either side is a top trader
+        const isTopMaker = TOP_TRADERS.has(event.maker_address);
+        const isTopTaker = TOP_TRADERS.has(event.taker_address);
+        if(!isTopMaker && !isTopTaker) continue;
+
+        const side = (market.yesTokenId === event.asset_id) ? 'BUY' : 'SELL';
+
+        await processTrade({
+          id:        event.id,
+          maker:     event.maker_address,
+          taker:     event.taker_address,
+          asset_id:  event.asset_id,
+          price:     event.price,
+          size:      event.size,
+          side,
+          timestamp: event.timestamp,
+          _coin:     market.coin,
+        });
+      }
+    } catch(e) { log('ERROR', `WS message: ${e.message}`); }
+  });
+
+  ws.on('error', e => log('ERROR', `WS error: ${e.message}`));
+
+  ws.on('close', (code) => {
+    log('INFO', `WS closed (${code}) — reconnecting in 5s`);
+    setTimeout(() => connectWebSocket(wsMarkets), 5000);
+  });
+
+  // Keepalive ping every 30s
+  setInterval(() => {
+    if(ws?.readyState === WebSocket.OPEN) ws.ping();
+  }, 30000);
 }
 
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  📊 POLYMARKET → KALSHI SIGNAL BOT                           ║');
+  console.log('║  🎯 POLYMARKET → KALSHI SIGNAL BOT v2                        ║');
+  console.log('║  Real-time WebSocket | Top 100 traders | 15-min crypto       ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
-  log('INFO', `Window:${CONFIG.signal.timeWindowMinutes}min | MinTraders:${CONFIG.signal.minTraders} | Threshold:${CONFIG.signal.matchThreshold}/100 | Crypto 15min only`);
-  if(!CONFIG.kalshi.apiKey) log('WARN', 'No Kalshi API key — matching disabled');
+  // Add any extra traders from env var
+  if(process.env.TRADER_ADDRESSES) {
+    const extra = process.env.TRADER_ADDRESSES.split(',').map(a=>a.trim().toLowerCase()).filter(Boolean);
+    extra.forEach(a => TOP_TRADERS.add(a));
+    log('INFO', `Loaded ${extra.length} extra traders from TRADER_ADDRESSES`);
+  }
 
-  startDashboard();
-
-  const traders = await fetchLeaderboard();
-  log('INFO', `Ready: ${traders.length} traders loaded`);
+  log('INFO', `Watching ${TOP_TRADERS.size} top traders`);
+  log('INFO', `Signal: ${CONFIG.minTraders}+ traders same side within ${CONFIG.windowSecs/60}min`);
+  log('INFO', `Alert window: last ${CONFIG.kalshiWindowMin}min before Kalshi settlement`);
+  log('INFO', `Min trade size: $${CONFIG.minTradeUsd}`);
 
   await discord(
-    `📊 **Polymarket → Kalshi Bot ONLINE**\n` +
+    `🎯 **Polymarket → Kalshi Bot ONLINE**\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Tracking **${traders.length}** top traders\n` +
-    `⏱  Window: **${CONFIG.signal.timeWindowMinutes}min** | Min: **${CONFIG.signal.minTraders}** traders\n` +
-    `🔗 Kalshi threshold: **${CONFIG.signal.matchThreshold}/100**\n` +
-    `🪙 Crypto 15min markets only | No duplicate signals`
+    `👥 Watching **${TOP_TRADERS.size}** top Polymarket crypto traders\n` +
+    `📡 Real-time WebSocket feed\n` +
+    `⚡ Signal: **${CONFIG.minTraders}+** traders same side within **${CONFIG.windowSecs/60}min**\n` +
+    `⏱  Alerts fire in **last ${CONFIG.kalshiWindowMin}min** before Kalshi settlement\n` +
+    `🪙 Coins: **${CONFIG.COINS.join(', ')}**`
   );
 
-  await runPollCycle();
+  // Fetch active markets
+  log('INFO', 'Fetching active Polymarket 5-min crypto markets...');
+  const markets = await fetchPolyMarkets();
 
-  // Poll every N minutes
-  cron.schedule(`*/${CONFIG.polling.tradesMinutes} * * * *`, () => {
-    log('POLL', 'Cron: polling trades');
-    runPollCycle();
-  });
+  if(markets.length === 0) {
+    log('WARN', 'No 5-min markets found via REST — WebSocket will still listen for any trades from top traders');
+    log('WARN', 'This can happen if markets are between windows — will retry in 5min');
+  }
 
-  // Refresh leaderboard every N hours
-  cron.schedule(`0 */${CONFIG.polling.leaderboardHours} * * *`, () => {
-    log('POLL', 'Cron: refreshing leaderboard');
-    fetchLeaderboard();
-  });
+  // Connect WebSocket
+  connectWebSocket(markets);
 
-  log('INFO', 'Running — Ctrl+C to stop');
+  // Refresh markets every 5 minutes (new 5-min markets open constantly)
+  setInterval(async () => {
+    log('INFO', 'Refreshing market list...');
+    const fresh = await fetchPolyMarkets();
+    if(fresh.length > 0) {
+      wsMarkets = fresh;
+      // Reconnect WS with new markets
+      if(ws?.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    }
+    // Clear Kalshi cache every refresh
+    kalshiCache.clear();
+    // Clear alert dedup set every 15min window
+    alertedThisWindow.clear();
+  }, 5 * 60 * 1000);
+
+  // Also poll every 60s as fallback (catches trades WS missed)
+  setInterval(async () => {
+    if(wsMarkets.length > 0) {
+      await pollRecentTrades(wsMarkets);
+    }
+  }, 60 * 1000);
+
+  // Status log every 5min
+  setInterval(() => {
+    const secsLeft = secsToNextSettlement();
+    const inWindow = inKalshiAlertWindow();
+    log('INFO', `Status | Next settlement: ${nextSettlementTime()} (${secsLeft}s) | In alert window: ${inWindow} | Markets watched: ${wsMarkets.length}`);
+
+    // Log current signal states
+    for(const [key, state] of signalState) {
+      if(state.traders.size > 0) {
+        log('INFO', `  Signal state: ${key} = ${state.traders.size} traders`);
+      }
+    }
+  }, 5 * 60 * 1000);
+
+  log('INFO', '✅ Bot running — watching for signals...');
 }
 
 process.on('SIGINT', async () => {
@@ -703,4 +604,8 @@ process.on('SIGINT', async () => {
 });
 
 process.on('unhandledRejection', e => log('ERROR', `Unhandled: ${e.message}`));
-main().catch(e => { log('ERROR', `Fatal: ${e.message}`); process.exit(1); });
+
+main().catch(e => {
+  log('ERROR', `Fatal: ${e.message}`);
+  process.exit(1);
+});
