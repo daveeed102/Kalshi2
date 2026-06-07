@@ -501,68 +501,94 @@ function currentPolySlug(coinName) {
 }
 
 // ── FETCH TODAY'S POLYMARKET TOKEN IDs ────────────────────────
-// Uses Gamma API to get clobTokenIds for the current 5-min window
-// No auth required
+// Real Polymarket 5-min slugs use Unix timestamps: btc-updown-5m-1769431200
+// We search by market title text using the Gamma /markets endpoint
+// No auth required — Gamma API is fully public
 async function fetchPolyMarkets() {
-  const markets = [];
+  const markets  = [];
+  const coinKeys = Object.keys(COIN_SLUGS);
 
-  for(const [coin, slugBase] of Object.entries(COIN_SLUGS)) {
-    // Try current window and next window
-    for(let offset = 0; offset <= 1; offset++) {
-      try {
-        const now    = new Date();
-        const etMs   = now.getTime() - (4 * 60 * 60 * 1000) + (offset * 5 * 60 * 1000);
-        const et     = new Date(etMs);
-        const h      = et.getUTCHours();
-        const m      = et.getUTCMinutes();
-        const day    = et.getUTCDate();
-        const month  = et.getUTCMonth();
-        const MONTHS = ['january','february','march','april','may','june',
-                        'july','august','september','october','november','december'];
-        const startMin = Math.floor(m / 5) * 5;
-        const endMin   = startMin + 5;
-        const endH     = endMin >= 60 ? h + 1 : h;
-        const endMinN  = endMin >= 60 ? 0 : endMin;
-        const fmt = (hh, mm) => {
-          const sfx = hh < 12 ? 'am' : 'pm';
-          const h12 = hh % 12 === 0 ? 12 : hh % 12;
-          return `${h12}-${String(mm).padStart(2,'0')}${sfx}`;
-        };
-        const slug = `${slugBase}-up-or-down-${MONTHS[month]}-${day}-${fmt(h,startMin)}-${fmt(endH,endMinN)}-et`;
+  // Search for each coin's active 5-min markets
+  for(const coin of coinKeys) {
+    try {
+      // Search by title keywords — Gamma supports text search
+      const coinName = COIN_SLUGS[coin]; // 'bitcoin', 'ethereum', etc
+      const r = await fetch(
+        `${CONFIG.POLY_REST}/markets?active=true&closed=false&limit=20&tag_slug=crypto`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      if(!r.ok){ log('WARN', `Gamma ${r.status} for ${coin}`); continue; }
 
-        // Query Gamma API by slug — no auth needed
-        const r = await fetch(
-          `${CONFIG.POLY_REST}/markets?slug=${slug}&active=true&closed=false`,
-          { headers: { 'Accept': 'application/json' } }
-        );
-        if(!r.ok) continue;
+      const d     = await r.json();
+      const items = Array.isArray(d) ? d : (d.markets || d.data || []);
 
-        const d = await r.json();
-        const items = Array.isArray(d) ? d : (d.markets || d.data || []);
-        if(!items.length) continue;
+      // Filter to this coin's 5-min "up or down" markets
+      const coinMatches = items.filter(m => {
+        const t = (m.question || m.title || '').toLowerCase();
+        return t.includes(coinName) && t.includes('up or down');
+      });
 
-        const m0      = items[0];
-        const clobRaw = m0.clobTokenIds;
-        const clobIds = clobRaw
-          ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw)
-          : null;
+      if(!coinMatches.length) continue;
 
-        const yesTokenId = clobIds?.[0];
-        const noTokenId  = clobIds?.[1];
-        if(!yesTokenId) continue;
+      // Pick the most recently created / soonest ending one
+      const best = coinMatches[0];
+      const clobRaw  = best.clobTokenIds;
+      const clobIds  = clobRaw
+        ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw)
+        : null;
+      const yesTokenId = clobIds?.[0];
+      const noTokenId  = clobIds?.[1];
+      if(!yesTokenId) continue;
 
-        const title = m0.question || m0.title || slug;
-        markets.push({ coin, title, conditionId: m0.conditionId || m0.condition_id, yesTokenId, noTokenId, marketId: m0.id });
-        log('INFO', `✅ Poly ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
-        break; // found this coin — move to next
-      } catch(e) {
-        log('WARN', `Poly slug fetch ${coin}: ${e.message}`);
-      }
+      const title = best.question || best.title || coin;
+      markets.push({ coin, title, conditionId: best.conditionId || best.condition_id, yesTokenId, noTokenId, marketId: best.id });
+      log('INFO', `✅ Poly ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
+
+    } catch(e) {
+      log('WARN', `fetchPolyMarkets ${coin}: ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 150));
   }
 
-  log('INFO', `Polymarket markets found: ${markets.length}/${Object.keys(COIN_SLUGS).length}`);
+  // If tag_slug approach gave nothing, try the events endpoint
+  if(markets.length === 0) {
+    log('INFO', 'tag_slug gave 0 — trying events search...');
+    try {
+      const r = await fetch(
+        `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=100`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      if(r.ok) {
+        const d     = await r.json();
+        const items = Array.isArray(d) ? d : (d.events || d.data || []);
+        const COIN_NAMES = {
+          BTC: ['bitcoin'], ETH: ['ethereum'], SOL: ['solana'],
+          XRP: ['xrp'], DOGE: ['dogecoin','doge'],
+        };
+        for(const item of items) {
+          for(const m of (item.markets || [item])) {
+            const t = (m.question || m.title || item.title || '').toLowerCase();
+            if(!t.includes('up or down')) continue;
+            let coin = null;
+            for(const [c, names] of Object.entries(COIN_NAMES)){
+              if(names.some(n => t.includes(n))){ coin = c; break; }
+            }
+            if(!coin) continue;
+            if(markets.find(x => x.coin === coin)) continue; // already have this coin
+            const clobRaw = m.clobTokenIds;
+            const clobIds = clobRaw ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw) : null;
+            const yesTokenId = clobIds?.[0];
+            if(!yesTokenId) continue;
+            const title = m.question || m.title || item.title || '';
+            markets.push({ coin, title, conditionId: m.conditionId||m.condition_id, yesTokenId, noTokenId: clobIds?.[1], marketId: m.id });
+            log('INFO', `✅ Poly ${coin} (events): ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
+          }
+        }
+      }
+    } catch(e) { log('WARN', `events fallback: ${e.message}`); }
+  }
+
+  log('INFO', `Polymarket markets found: ${markets.length}/${coinKeys.length}`);
   return markets;
 }
 
