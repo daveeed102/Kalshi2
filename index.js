@@ -283,6 +283,10 @@ async function processTrade(trade) {
   }
 }
 
+// ── PAPER TRADING STATE ──────────────────────────────────────
+const PAPER_MODE = process.env.PAPER_TRADING !== 'false'; // default ON
+const paperTrades = [];
+
 // ── FIRE SIGNAL ───────────────────────────────────────────────
 async function fireSignal(coin, side, traders, ts) {
   const secsLeft  = secsToNextSettlement();
@@ -332,55 +336,126 @@ async function fireSignal(coin, side, traders, ts) {
   ].join('\n'));
 
   log('SIGNAL', `Alert fired: ${coin} ${side} → ${kalshiTicker} | ${secsLeft}s left`);
+
+  // Paper trade simulation
+  if(PAPER_MODE) {
+    const entry = kalshiPrice || 0.5;
+    const sizeUsd = 5; // simulate $5 trade
+    const paper = { id: Date.now(), coin, side, ticker: kalshiTicker, entry, sizeUsd, openedAt: Date.now(), secsLeft, settled: false };
+    paperTrades.push(paper);
+    log('PAPER', `📋 Paper trade opened: ${coin} ${side} @ ${(entry*100).toFixed(1)}¢ | $${sizeUsd} | settles in ${secsLeft}s`);
+
+    // Auto-settle after the window closes
+    setTimeout(async () => {
+      // Simulate outcome — fetch current Kalshi price as proxy
+      try {
+        const mk = await fetchKalshiMarket(coin);
+        const exitPrice = mk?.price || (Math.random() > 0.5 ? 1.0 : 0.0); // 1 = win, 0 = loss
+        const pnl = (exitPrice - paper.entry) * (paper.sizeUsd / paper.entry);
+        paper.settled  = true;
+        paper.exitPrice = exitPrice;
+        paper.pnl       = pnl;
+        const won = pnl > 0;
+        log('PAPER', `📋 Paper trade settled: ${coin} ${side} | ${won?'WIN':'LOSS'} | PnL: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`);
+
+        const wins   = paperTrades.filter(p=>p.settled&&p.pnl>0).length;
+        const losses = paperTrades.filter(p=>p.settled&&p.pnl<=0).length;
+        const totalPnl = paperTrades.filter(p=>p.settled).reduce((s,p)=>s+p.pnl,0);
+
+        await discord([
+          `📋 **PAPER TRADE SETTLED — ${coin} ${side}**`,
+          `━━━━━━━━━━━━━━━━━━━━`,
+          `📥 Entry: **${(paper.entry*100).toFixed(1)}¢** | Exit: **${(exitPrice*100).toFixed(1)}¢**`,
+          `${won?'📈':'📉'} PnL: **${pnl>=0?'+':''}$${pnl.toFixed(2)}**`,
+          `━━━━━━━━━━━━━━━━━━━━`,
+          `📊 Session: **${wins}W/${losses}L** | Total PnL: **${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}**`,
+        ].join('\n'));
+      } catch(e) { log('ERROR',`Paper settle: ${e.message}`); }
+    }, (secsLeft + 5) * 1000);
+  }
 }
 
 // ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
 async function fetchPolyMarkets() {
   const markets = [];
-  for(const coin of CONFIG.COINS) {
-    try {
-      // Search for active 5-min markets for this coin
-      const r = await fetch(
-        `${CONFIG.POLY_REST}/markets?active=true&closed=false&tag_id=21&limit=100&search=${coin}+5+min`
-      );
-      if(!r.ok) continue;
-      const d = await r.json();
-      const raw = Array.isArray(d) ? d : (d.data || d.results || []);
+  // Polymarket 5-min market titles look like:
+  // "Bitcoin Up or Down - June 5, 3:50PM-3:55PM ET"
+  // "Ethereum Up or Down - June 5, 3:50PM-3:55PM ET"
+  // We fetch events from the Gamma API with crypto tag
 
-      for(const m of raw) {
-        const title = (m.question||m.title||'').toLowerCase();
-        const isCoin = title.includes(coin.toLowerCase());
-        const is5min = title.includes('5') && (title.includes('min') || title.includes('minute'));
-        if(isCoin && is5min && m.active !== false && !m.closed) {
-          // Get token IDs for YES outcome
-          const tokens = m.tokens || m.outcomes || [];
-          const yesToken = tokens.find(t =>
-            (t.outcome||'').toUpperCase().includes('YES') ||
-            (t.outcome||'').toUpperCase().includes('ABOVE') ||
-            (t.outcome||'').toUpperCase().includes('OVER')
-          );
-          const noToken = tokens.find(t =>
-            (t.outcome||'').toUpperCase().includes('NO') ||
-            (t.outcome||'').toUpperCase().includes('BELOW') ||
-            (t.outcome||'').toUpperCase().includes('UNDER')
-          );
+  const COIN_NAMES = {
+    BTC:  ['bitcoin','btc'],
+    ETH:  ['ethereum','eth'],
+    SOL:  ['solana','sol'],
+    XRP:  ['xrp','ripple'],
+    DOGE: ['doge','dogecoin'],
+    BNB:  ['bnb','binance'],
+    HYPE: ['hype','hyperliquid'],
+  };
 
-          if(yesToken?.token_id || m.condition_id) {
-            markets.push({
-              coin,
-              title: m.question||m.title,
-              conditionId: m.condition_id,
-              yesTokenId:  yesToken?.token_id,
-              noTokenId:   noToken?.token_id,
-              marketId:    m.id,
-            });
-            log('INFO', `Found ${coin} 5-min market: ${(m.question||m.title||'').slice(0,60)}`);
-          }
+  try {
+    // Fetch active crypto events — 5min markets live here
+    // Try multiple endpoints
+    const urls = [
+      `${CONFIG.POLY_REST}/events?active=true&closed=false&tag_id=21&limit=100`,
+      `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=200&tag=crypto`,
+      `${CONFIG.POLY_REST}/markets?active=true&closed=false&limit=200`,
+    ];
+
+    let allMarkets = [];
+    for(const url of urls) {
+      try {
+        const r = await fetch(url, { headers:{ 'Accept':'application/json','User-Agent':'Mozilla/5.0' } });
+        if(!r.ok){ log('WARN',`${url} → ${r.status}`); continue; }
+        const d = await r.json();
+        const items = Array.isArray(d) ? d : (d.data||d.results||d.events||d.markets||[]);
+        if(items.length > 0){ allMarkets = items; log('INFO',`Got ${items.length} items from ${url.split('?')[0]}`); break; }
+      } catch(e){ log('WARN',`Endpoint ${url}: ${e.message}`); }
+    }
+
+    if(!allMarkets.length){
+      log('WARN','No markets from REST — will rely on WebSocket trade matching by trader address');
+      return [];
+    }
+
+    for(const item of allMarkets) {
+      // Item could be an event (with nested markets) or a market directly
+      const subMarkets = item.markets || [item];
+
+      for(const m of subMarkets) {
+        const title  = (m.question||m.title||item.title||'').toLowerCase();
+        const is5min = (title.includes('5') && (title.includes('min')||title.includes(':5')||title.includes('3:5')||title.includes('4:5')||title.includes('2:5')||title.includes('1:5')||title.includes('0:5'))) ||
+                       title.includes('up or down');
+        if(!is5min) continue;
+        if(m.active === false || m.closed === true) continue;
+
+        // Match coin
+        let coin = null;
+        for(const [c, names] of Object.entries(COIN_NAMES)){
+          if(names.some(n => title.includes(n))){ coin = c; break; }
         }
+        if(!coin) continue;
+
+        // Extract token IDs — Polymarket uses clobTokenIds array
+        const clobIds = m.clobTokenIds ? JSON.parse(m.clobTokenIds) : null;
+        const yesTokenId = clobIds?.[0] || m.tokens?.[0]?.token_id || m.clob_token_ids?.[0];
+        const noTokenId  = clobIds?.[1] || m.tokens?.[1]?.token_id || m.clob_token_ids?.[1];
+        const condId     = m.conditionId || m.condition_id;
+
+        markets.push({
+          coin,
+          title:       m.question || m.title || item.title,
+          conditionId: condId,
+          yesTokenId,
+          noTokenId,
+          marketId:    m.id,
+        });
+        log('INFO', `✅ ${coin} 5-min: ${(m.question||m.title||'').slice(0,60)} | YES:${yesTokenId?.slice(0,8)||'?'}`);
       }
-    } catch(e) { log('ERROR', `fetchPolyMarkets ${coin}: ${e.message}`); }
-  }
-  log('INFO', `Found ${markets.length} active 5-min crypto markets on Polymarket`);
+    }
+  } catch(e) { log('ERROR', `fetchPolyMarkets: ${e.message}`); }
+
+  log('INFO', `Found ${markets.length} active 5-min crypto markets`);
   return markets;
 }
 
@@ -451,7 +526,8 @@ function connectWebSocket(markets) {
       .slice(0, 200); // WS limit
 
     if(assetIds.length === 0) {
-      log('WARN', 'No asset IDs to subscribe to — markets may not have token IDs yet');
+      log('WARN', 'No asset IDs yet — WebSocket open, will subscribe when markets load');
+      // Still keep WS open — we'll reconnect with IDs after market refresh
       return;
     }
 
@@ -594,7 +670,10 @@ async function main() {
     }
   }, 5 * 60 * 1000);
 
-  log('INFO', '✅ Bot running — watching for signals...');
+  log('INFO', `✅ Bot running | Paper trading: ${PAPER_MODE?'ON (simulating $5 trades)':'OFF'}`);
+  if(PAPER_MODE) {
+    log('INFO', 'PAPER MODE: Signals will be alerted AND simulated. Set PAPER_TRADING=false to disable.');
+  }
 }
 
 process.on('SIGINT', async () => {
