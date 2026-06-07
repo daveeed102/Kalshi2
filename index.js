@@ -330,103 +330,10 @@ async function onKalshiTrade(trade) {
   }
 }
 
-// ── WEBSOCKET — KALSHI MARKET DATA ───────────────────────────
-// Subscribe to all 15-min crypto tickers
-// Kalshi WS is public for market data — no auth needed
-
-let ws = null;
-
+// ── WEBSOCKET DISABLED ───────────────────────────────────────
+// Kalshi WS requires auth that isn't working — using polling instead
 function connectKalshiWS() {
-  const wsUrl = `${CONFIG.kalshiBase.replace('https','wss').replace('http','ws')}/trade-api/ws/v2`;
-  log('INFO', `Connecting to Kalshi WebSocket: ${wsUrl}`);
-
-  // Kalshi WS requires auth headers
-  const wsTs  = Date.now().toString();
-  const wsPath = '/trade-api/ws/v2';
-  let wsHeaders = {};
-  if(CONFIG.kalshiKey && CONFIG.kalshiSecret) {
-    try {
-      const msg = wsTs + 'GET' + wsPath;
-      const sig = crypto.createSign('SHA256');
-      sig.update(msg);
-      const signature = sig.sign({
-        key: CONFIG.kalshiSecret,
-        padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-        saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
-      }, 'base64');
-      wsHeaders = {
-        'KALSHI-ACCESS-KEY':       CONFIG.kalshiKey,
-        'KALSHI-ACCESS-TIMESTAMP': wsTs,
-        'KALSHI-ACCESS-SIGNATURE': signature,
-      };
-    } catch(e) { log('ERROR', `WS auth: ${e.message}`); }
-  }
-  ws = new WebSocket(wsUrl, { headers: wsHeaders });
-
-  ws.on('open', () => {
-    log('INFO', '✅ Kalshi WebSocket connected');
-
-    // Subscribe to fills (trades) on all series
-    const tickers = Object.values(marketCache)
-      .map(m => m.ticker)
-      .filter(Boolean);
-
-    if(!tickers.length) {
-      log('WARN', 'No market tickers yet — will resubscribe after market refresh');
-      return;
-    }
-
-    // Subscribe to trade feed for each market
-    for(const ticker of tickers) {
-      ws.send(JSON.stringify({
-        id:   ticker,
-        cmd:  'subscribe',
-        params: {
-          channels: ['trade'],
-          market_tickers: [ticker],
-        },
-      }));
-    }
-    log('INFO', `Subscribed to trade feed for ${tickers.length} markets: ${tickers.join(', ')}`);
-  });
-
-  ws.on('message', async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      // Handle trade events
-      if(msg.type === 'trade' || msg.channel === 'trade') {
-        const data = msg.msg || msg.data || msg;
-        if(data.market_ticker) {
-          await onKalshiTrade(data);
-        }
-      }
-
-      // Handle orderbook/ticker snapshots — extract recent trades
-      if(msg.type === 'fills' || msg.channel === 'fills') {
-        const fills = msg.msg?.fills || msg.data?.fills || [];
-        for(const fill of fills) {
-          await onKalshiTrade({ ...fill, action: 'buy' });
-        }
-      }
-    } catch(e) {
-      if(!e.message.includes('JSON')) {
-        log('ERROR', `WS message: ${e.message}`);
-      }
-    }
-  });
-
-  ws.on('error', e => log('ERROR', `WS error: ${e.message}`));
-
-  ws.on('close', (code) => {
-    log('INFO', `WS closed (${code}) — reconnecting in 5s`);
-    setTimeout(connectKalshiWS, 5000);
-  });
-
-  // Keepalive
-  setInterval(() => {
-    if(ws?.readyState === WebSocket.OPEN) ws.ping();
-  }, 20000);
+  log('INFO', 'Using polling mode (WebSocket disabled)');
 }
 
 // ── POLL RECENT KALSHI TRADES (FALLBACK) ─────────────────────
@@ -439,25 +346,34 @@ async function pollKalshiTrades() {
     if(!market?.ticker) continue;
 
     try {
-      const r = await fetch(
-        `${CONFIG.kalshiBase}/trade-api/v2/markets/${market.ticker}/trades?limit=10`
-      );
-      if(!r.ok) continue;
+      const url = `${CONFIG.kalshiBase}/trade-api/v2/markets/${market.ticker}/trades?limit=20`;
+      const r   = await fetch(url);
+
+      if(!r.ok) {
+        log('WARN', `Poll ${coin} ${r.status}: ${market.ticker}`);
+        continue;
+      }
+
       const d      = await r.json();
       const trades = d.trades || [];
-      const cutoff = Math.floor(Date.now()/1000) - 90; // last 90 seconds
+      const cutoff = Math.floor(Date.now()/1000) - 120; // last 2 minutes
+
+      if(trades.length > 0) {
+        log('INFO', `Poll ${coin}: ${trades.length} trades found on ${market.ticker}`);
+      }
 
       for(const t of trades) {
         const ts = t.created_time
           ? Math.floor(new Date(t.created_time).getTime()/1000)
-          : 0;
+          : Math.floor(Date.now()/1000);
         if(ts < cutoff) continue;
+        log('INFO', `  Raw trade: ${JSON.stringify(t).slice(0,120)}`);
         await onKalshiTrade({ ...t, market_ticker: market.ticker });
       }
     } catch(e) {
       log('WARN', `pollKalshiTrades(${coin}): ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 150));
   }
 }
 
@@ -549,10 +465,7 @@ async function main() {
   // Refresh markets every 5 minutes (new windows open)
   setInterval(async () => {
     await refreshMarkets();
-    // Reconnect WS with updated tickers
-    if(ws?.readyState === WebSocket.OPEN) {
-      ws.close(1000, 'refresh');
-    }
+  
   }, 5 * 60 * 1000);
 
   // Poll trades every 10s — primary detection mechanism
