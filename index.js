@@ -450,88 +450,135 @@ async function fireSignal(coin, side, traders, ts) {
 }
 
 // ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
+// ── GENERATE TODAY'S MARKET SLUGS ────────────────────────────
+function getTodayMarketSlugs() {
+  const now    = new Date();
+  const utcH   = now.getUTCHours();
+  const utcM   = now.getUTCMinutes();
+  const offset = 4; // EDT (UTC-4)
+  let etH      = utcH - offset;
+  let etMon    = now.getUTCMonth();
+  let etDay    = now.getUTCDate();
+  if(etH < 0){ etH += 24; etDay--; }
+
+  const MONTHS = ['january','february','march','april','may','june',
+                  'july','august','september','october','november','december'];
+  const COINS  = { BTC:'bitcoin', ETH:'ethereum', SOL:'solana',
+                   XRP:'xrp', DOGE:'dogecoin' };
+
+  const slugs = [];
+  const baseMin = Math.floor(utcM / 5) * 5;
+
+  for(let i = -2; i < 18; i++) { // -10min past to +90min future
+    const totalMins = etH * 60 + baseMin + i * 5;
+    const sh = Math.floor(totalMins / 60) % 24;
+    const sm = ((totalMins % 60) + 60) % 60;
+    const eh = Math.floor((totalMins + 5) / 60) % 24;
+    const em = ((totalMins + 5) % 60 + 60) % 60;
+
+    const fmt = (h, m) => {
+      const sfx = h < 12 ? 'am' : 'pm';
+      const h12 = h % 12 || 12;
+      return `${h12}-${String(m).padStart(2,'0')}${sfx}`;
+    };
+
+    for(const [coin, name] of Object.entries(COINS)) {
+      slugs.push({
+        coin,
+        slug: `${name}-up-or-down-${MONTHS[etMon]}-${etDay}-${fmt(sh,sm)}-${fmt(eh,em)}-et`,
+      });
+    }
+  }
+  return slugs;
+}
+
 async function fetchPolyMarkets() {
-  const markets = [];
-  // Polymarket 5-min market titles look like:
-  // "Bitcoin Up or Down - June 5, 3:50PM-3:55PM ET"
-  // "Ethereum Up or Down - June 5, 3:50PM-3:55PM ET"
-  // We fetch events from the Gamma API with crypto tag
+  const markets  = [];
+  const slugData = getTodayMarketSlugs();
+  log('INFO', `Fetching today's 5-min markets by slug (${slugData.length} candidates)...`);
 
-  const COIN_NAMES = {
-    BTC:  ['bitcoin','btc'],
-    ETH:  ['ethereum','eth'],
-    SOL:  ['solana','sol'],
-    XRP:  ['xrp','ripple'],
-    DOGE: ['doge','dogecoin'],
-    BNB:  ['bnb','binance'],
-    HYPE: ['hype','hyperliquid'],
-  };
-
-  try {
-    // Fetch active crypto events — 5min markets live here
-    // Try multiple endpoints
-    const urls = [
-      `${CONFIG.POLY_REST}/events?active=true&closed=false&tag_id=21&limit=100`,
-      `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=200&tag=crypto`,
-      `${CONFIG.POLY_REST}/markets?active=true&closed=false&limit=200`,
-    ];
-
-    let allMarkets = [];
-    for(const url of urls) {
+  // Batch fetch slugs
+  const batchSize = 10;
+  for(let i = 0; i < slugData.length; i += batchSize) {
+    const batch = slugData.slice(i, i + batchSize);
+    await Promise.all(batch.map(async ({ coin, slug }) => {
       try {
-        const r = await fetch(url, { headers:{ 'Accept':'application/json','User-Agent':'Mozilla/5.0' } });
-        if(!r.ok){ log('WARN',`${url} → ${r.status}`); continue; }
-        const d = await r.json();
-        const items = Array.isArray(d) ? d : (d.data||d.results||d.events||d.markets||[]);
-        if(items.length > 0){ allMarkets = items; log('INFO',`Got ${items.length} items from ${url.split('?')[0]}`); break; }
-      } catch(e){ log('WARN',`Endpoint ${url}: ${e.message}`); }
-    }
+        const r = await fetch(
+          `${CONFIG.POLY_REST}/events?slug=${slug}`,
+          { headers:{ 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' } }
+        );
+        if(!r.ok) return;
+        const d    = await r.json();
+        const item = Array.isArray(d) ? d[0] : (d.events?.[0] || d.data?.[0] || d);
+        if(!item || !item.markets) return;
 
-    if(!allMarkets.length){
-      log('WARN','No markets from REST — will rely on WebSocket trade matching by trader address');
-      return [];
-    }
+        for(const m of item.markets) {
+          const clobIds    = m.clobTokenIds
+            ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds)
+            : null;
+          const yesTokenId = clobIds?.[0];
+          const noTokenId  = clobIds?.[1];
+          const title      = m.question || m.title || item.title || slug;
 
-    for(const item of allMarkets) {
-      // Item could be an event (with nested markets) or a market directly
-      const subMarkets = item.markets || [item];
+          if(!yesTokenId) return;
 
-      for(const m of subMarkets) {
-        const title  = (m.question||m.title||item.title||'').toLowerCase();
-        const is5min = (title.includes('5') && (title.includes('min')||title.includes(':5')||title.includes('3:5')||title.includes('4:5')||title.includes('2:5')||title.includes('1:5')||title.includes('0:5'))) ||
-                       title.includes('up or down');
-        if(!is5min) continue;
-        if(m.active === false || m.closed === true) continue;
-
-        // Match coin
-        let coin = null;
-        for(const [c, names] of Object.entries(COIN_NAMES)){
-          if(names.some(n => title.includes(n))){ coin = c; break; }
+          markets.push({ coin, title, conditionId: m.conditionId||m.condition_id, yesTokenId, noTokenId, marketId: m.id });
+          log('INFO', `✅ ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,8)}`);
         }
-        if(!coin) continue;
+      } catch(e) {}
+    }));
+    await new Promise(r => setTimeout(r, 80));
+  }
 
-        // Extract token IDs — Polymarket uses clobTokenIds array
-        const clobIds = m.clobTokenIds ? JSON.parse(m.clobTokenIds) : null;
-        const yesTokenId = clobIds?.[0] || m.tokens?.[0]?.token_id || m.clob_token_ids?.[0];
-        const noTokenId  = clobIds?.[1] || m.tokens?.[1]?.token_id || m.clob_token_ids?.[1];
-        const condId     = m.conditionId || m.condition_id;
+  // Fallback: events API with today-only filter
+  if(markets.length === 0) {
+    log('INFO', 'Slug fetch empty — trying events API fallback...');
+    const COIN_NAMES = { BTC:['bitcoin','btc'], ETH:['ethereum','eth'],
+                         SOL:['solana','sol'], XRP:['xrp'], DOGE:['doge'] };
+    const now   = new Date();
+    const etNow = new Date(now.getTime() - 4*3600*1000);
+    const MONS  = ['january','february','march','april','may','june',
+                   'july','august','september','october','november','december'];
+    const todayMon = MONS[etNow.getMonth()];
+    const todayDay = String(etNow.getDate());
 
-        markets.push({
-          coin,
-          title:       m.question || m.title || item.title,
-          conditionId: condId,
-          yesTokenId,
-          noTokenId,
-          marketId:    m.id,
-        });
-        log('INFO', `✅ ${coin} 5-min: ${(m.question||m.title||'').slice(0,60)} | YES:${yesTokenId?.slice(0,8)||'?'}`);
-      }
+    for(const offset of [0,100,200,300]) {
+      try {
+        const r = await fetch(
+          `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=100&offset=${offset}`,
+          { headers:{ 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' } }
+        );
+        if(!r.ok) continue;
+        const d     = await r.json();
+        const items = Array.isArray(d) ? d : (d.data||d.events||[]);
+
+        for(const item of items) {
+          for(const m of (item.markets||[item])) {
+            const tl = (m.question||m.title||item.title||'').toLowerCase();
+            if(!tl.includes('up or down')) continue;
+            if(!tl.includes(todayMon) || !tl.includes(todayDay)) continue;
+
+            let coin = null;
+            for(const [c,names] of Object.entries(COIN_NAMES)){
+              if(names.some(n=>tl.includes(n))){ coin=c; break; }
+            }
+            if(!coin) continue;
+
+            const cids = m.clobTokenIds ? (typeof m.clobTokenIds==='string' ? JSON.parse(m.clobTokenIds):m.clobTokenIds) : null;
+            markets.push({ coin, title:m.question||m.title, conditionId:m.conditionId||m.condition_id,
+                           yesTokenId:cids?.[0], noTokenId:cids?.[1], marketId:m.id });
+            log('INFO', `✅ ${coin} (fallback): ${(m.question||'').slice(0,50)}`);
+          }
+        }
+        if(markets.length > 0) break;
+      } catch(e) {}
     }
-  } catch(e) { log('ERROR', `fetchPolyMarkets: ${e.message}`); }
+  }
 
   log('INFO', `Found ${markets.length} active 5-min crypto markets`);
   return markets;
 }
+
 
 // ── ALSO POLL RECENT TRADES (FALLBACK) ───────────────────────
 // Since WebSocket may miss some trades, also poll recent trades for top traders
