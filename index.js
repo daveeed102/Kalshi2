@@ -1,96 +1,40 @@
 // ============================================================
-// POLYMARKET → KALSHI SIGNAL BOT v2
-// Watches Polymarket 5-min crypto markets via WebSocket
-// Detects when 2+ top-100 traders buy the same side
-// Alerts you to copy on Kalshi during the last 5 min window
+// KALSHI COPY TRADER v3
+// - Watches ALL trades on Kalshi 15-min crypto markets
+// - Tracks win rates per trader
+// - When a high-win-rate trader bets → we copy for $5
+// - No Polymarket, no leaderboard scraping, no external deps
 // ============================================================
 require('dotenv').config();
-const fs        = require('fs');
-const path      = require('path');
-const fetch     = require('node-fetch');
+const fs       = require('fs');
+const path     = require('path');
+const fetch    = require('node-fetch');
 const WebSocket = require('ws');
-const Database  = require('better-sqlite3');
-const crypto    = require('crypto'); // built-in Node.js — no install needed
-
+const Database = require('better-sqlite3');
+const crypto   = require('crypto');
 
 // ── CONFIG ────────────────────────────────────────────────────
 const CONFIG = {
-  discord:   process.env.DISCORD_WEBHOOK_URL || '',
-  kalshiKey: process.env.KALSHI_API_KEY      || '',
-  kalshiUrl: process.env.KALSHI_BASE_URL     || 'https://api.elections.kalshi.com',
+  kalshiBase:   process.env.KALSHI_BASE_URL    || 'https://api.elections.kalshi.com',
+  kalshiKey:    process.env.KALSHI_API_KEY      || '',
+  kalshiSecret: process.env.KALSHI_PRIVATE_KEY  || '',
+  discord:      process.env.DISCORD_WEBHOOK_URL || '',
 
-  // Signal rules
-  minTraders:      parseInt(process.env.MIN_TRADERS)      || 2,   // 2+ traders to signal
-  windowSecs:      parseInt(process.env.WINDOW_SECS)      || 300, // 5 min window
-  minTradeUsd:     parseFloat(process.env.MIN_TRADE_USD)  || 10,  // ignore tiny trades
-  kalshiWindowMin: parseInt(process.env.KALSHI_WINDOW_MIN)|| 5,   // alert in last N min
+  ORDER_SIZE_USD:    parseFloat(process.env.ORDER_SIZE_USD)    || 5,
+  MIN_WIN_RATE:      parseFloat(process.env.MIN_WIN_RATE)      || 0.60, // 60% win rate to copy
+  MIN_TRADES:        parseInt(process.env.MIN_TRADES)          || 5,    // must have at least 5 settled trades
+  MAX_COPY_PRICE:    parseFloat(process.env.MAX_COPY_PRICE)    || 0.90, // don't buy if > 90¢
+  MIN_COPY_PRICE:    parseFloat(process.env.MIN_COPY_PRICE)    || 0.10, // don't buy if < 10¢
 
-  // Polymarket
-  POLY_WS:   'wss://ws-subscriptions-clob.polymarket.com/ws/market',
-  POLY_REST: 'https://gamma-api.polymarket.com',
-  CLOB_REST: 'https://clob.polymarket.com',
-
-  // Coins to watch
-  COINS: ['BTC','ETH','SOL','XRP','DOGE','BNB','HYPE'],
+  // Kalshi series tickers for 15-min crypto markets
+  SERIES: {
+    BTC:  'KXBTC15M',
+    ETH:  'KXETH15M',
+    SOL:  'KXSOL15M',
+    XRP:  'KXXRP15M',
+    DOGE: 'KXDOGE15M',
+  },
 };
-
-// ── TOP 100 TRADERS (from predicts.guru crypto leaderboard) ──
-// These are the actual Polymarket proxy wallet addresses
-// of the top traders by volume/profit in crypto markets
-const TOP_TRADERS = new Set([
-  // From predicts.guru leaderboard - top 50 by volume
-  "0xe9076a87c5ed90ef16e6fe6529c943baeca0cff6",
-  "0xa7a8c1fd4bfff08ea30214efa7efaf75d7c6580c",
-  "0xb687f00464e33934f5d591f224e71c3559ecaee5",
-  "0xbddf61af533ff524d27154e589d2d7a81510c684",
-  "0x08fff5b9a79576a7c6e18a9d05ece0658a34ba79",
-  "0xdf17f4a8dd01a4cfa6fc3da323a2baee5f8697d1",
-  "0x6480542954b70a674a74bd1a6015dec362dc8dc5",
-  "0xfe787d2da716d60e8acff57fb87eb13cd4d10319",
-  "0x59aed45d6b8c0a4fc67af69a371007b3cceb22d5",
-  "0x204f72f35326db932158cba6adff0b9a1da95e14",
-  "0x2c335066fe58fe9237c3d3dc7b275c2a034a0563",
-  "0x5bb0de4e97698184ead80c80cb17a26cd6f6814b",
-  "0x55eca3687ea7d69632ffe0f297ea3d5158bb8c7d",
-  "0x84cfffc3f16dcc353094de30d4a45226eccd2f63",
-  "0x5d189e816b4149be00977c1a3c8840374aec4972",
-  "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
-  "0x9501ec3b8b3e330ae593ebe5b071c3d11b648223",
-  "0xa5ea13a81d2b7e8e424b182bdc1db08e756bd96a",
-  "0x1521b47bf0c41f6b7fd3ad41cdec566812c8f23e",
-  "0x02e7f29f3e612a95a9ccca7131ce7dd5d56b59e5",
-  "0xee3ecc39c41e8a6b5399b1cd1b03d72f5271ebb5",
-  "0x5268527977f700f9bf9b6d5cd843859e4e70135d",
-  "0xfedc381bf3fb5d20433bb4a0216b15dbbc5c6398",
-  "0xed107a85a4585a381e48c7f7ca4144909e7dd2e5",
-  "0x4099db7f2d394449ccf89c8d42260ecaf1d79fb8",
-  "0xc8ab97a9089a9ff7e6ef0688e6e591a066946418",
-  "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
-  "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
-  "0x9097b9fd27dd69aa8170e1b16f1b8b839ad70ef0",
-  "0xf284ad6d607f777f34bc643cea587c33a886b9f9",
-  "0x4f29e103339919c4baaea2a60195cf1c8bb27a7e",
-  "0x2663daca3cecf3767ca1c3b126002a8578a8ed1f",
-  "0xf8831548531d56ad6a4331493243c447a827cd1f",
-  "0xcbba64cddd05171925ffd05d8f8abd38c83fdbff",
-  "0x06dc51826bc524d9a83770e7de9dd7e005b04524",
-  "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
-  "0xc21ea96be762bb55041529af6e386e7c53b80215",
-  "0x45bc74efa620b45c02308acaecdff1f7c06f978b",
-  "0xa8b202e6e9a4c2091b6860f1f5c9e9119bbc9a39",
-  "0x43e98f912cd6ddadaad88d3297e78c0648e688e5",
-  "0x99f0d31fdced5b3a0e5ee2867730a6644a6c9495",
-  "0x482bf5accdecfaffa67c14d4d4fbb59f428a3266",
-  "0xf5198df69e13937a40d1c76d6f72d9aa067d906b",
-  "0xa61ef8773ec2e821962306ca87d4b57e39ff0abd",
-  "0x1136368d7f6728e94ed14c532ab95a932f710c2e",
-  "0xf4145f880b6e3b099cc7b457e5ef3dbfeb192cd9",
-  "0x18469a63386b393ae4bbc6b74621ffe36b81a932",
-  "0x70d94a4ff67ed919a8480885cf0808afefe7a684",
-  "0xb00a5f0e2718c3ba1c502a55894db64688b477f1",
-  "0x672f13d830d3617efea21c2ec7f4bda5d2c27fcc",
-  // Extra addresses from TRADER_ADDRESSES env var added at runtime
-]);
 
 // ── LOGGER ────────────────────────────────────────────────────
 fs.mkdirSync(path.join(__dirname,'logs'), { recursive:true });
@@ -98,36 +42,58 @@ const logFile = path.join(__dirname,'logs','bot.log');
 function log(level, msg) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
   console.log(line);
-  fs.appendFileSync(logFile, line+'\n');
+  try { fs.appendFileSync(logFile, line+'\n'); } catch(e) {}
 }
 
 // ── DATABASE ──────────────────────────────────────────────────
 fs.mkdirSync(path.join(__dirname,'data'), { recursive:true });
-const db = new Database(path.join(__dirname,'data','signals.db'));
+const db = new Database(path.join(__dirname,'data','traders.db'));
 db.pragma('journal_mode = WAL');
 db.exec(`
-  CREATE TABLE IF NOT EXISTS signals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    coin TEXT, side TEXT,
-    traders TEXT, trader_count INTEGER,
-    kalshi_ticker TEXT, kalshi_price REAL,
-    fired_at INTEGER, window_end INTEGER
+  CREATE TABLE IF NOT EXISTS trader_stats (
+    member_id   TEXT PRIMARY KEY,
+    wins        INTEGER DEFAULT 0,
+    losses      INTEGER DEFAULT 0,
+    total_pnl   REAL    DEFAULT 0,
+    last_seen   INTEGER DEFAULT 0
   );
-  CREATE TABLE IF NOT EXISTS trades_seen (
-    id TEXT PRIMARY KEY,
-    trader TEXT, coin TEXT, side TEXT,
-    price REAL, size_usd REAL, ts INTEGER
+  CREATE TABLE IF NOT EXISTS market_trades (
+    id          TEXT PRIMARY KEY,
+    member_id   TEXT,
+    ticker      TEXT,
+    side        TEXT,
+    price       INTEGER,
+    count       INTEGER,
+    ts          INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS our_trades (
+    id          TEXT PRIMARY KEY,
+    ticker      TEXT,
+    side        TEXT,
+    entry_price INTEGER,
+    count       INTEGER,
+    size_usd    REAL,
+    opened_at   INTEGER,
+    closed_at   INTEGER,
+    exit_price  INTEGER,
+    pnl_usd     REAL,
+    status      TEXT DEFAULT 'OPEN',
+    copied_from TEXT
   );
 `);
 
-const insertSignal = db.prepare(`
-  INSERT INTO signals (coin,side,traders,trader_count,kalshi_ticker,kalshi_price,fired_at,window_end)
-  VALUES (@coin,@side,@traders,@trader_count,@kalshi_ticker,@kalshi_price,@fired_at,@window_end)
+const upsertTrader = db.prepare(`
+  INSERT INTO trader_stats (member_id, wins, losses, total_pnl, last_seen)
+  VALUES (@member_id, 0, 0, 0, @last_seen)
+  ON CONFLICT(member_id) DO UPDATE SET last_seen=@last_seen
 `);
-const insertTrade = db.prepare(`
-  INSERT OR IGNORE INTO trades_seen (id,trader,coin,side,price,size_usd,ts)
-  VALUES (@id,@trader,@coin,@side,@price,@size_usd,@ts)
-`);
+const addWin  = db.prepare(`UPDATE trader_stats SET wins=wins+1,   total_pnl=total_pnl+@pnl WHERE member_id=@id`);
+const addLoss = db.prepare(`UPDATE trader_stats SET losses=losses+1, total_pnl=total_pnl+@pnl WHERE member_id=@id`);
+const getTrader = db.prepare(`SELECT * FROM trader_stats WHERE member_id=?`);
+const insertMarketTrade = db.prepare(`INSERT OR IGNORE INTO market_trades VALUES (@id,@member_id,@ticker,@side,@price,@count,@ts)`);
+const insertOurTrade  = db.prepare(`INSERT INTO our_trades VALUES (@id,@ticker,@side,@entry_price,@count,@size_usd,@opened_at,null,null,null,'OPEN',@copied_from)`);
+const updateOurTrade  = db.prepare(`UPDATE our_trades SET status=@status,closed_at=@closed_at,exit_price=@exit_price,pnl_usd=@pnl_usd WHERE id=@id`);
+const getOpenTrades   = db.prepare(`SELECT * FROM our_trades WHERE status='OPEN'`);
 
 // ── DISCORD ───────────────────────────────────────────────────
 async function discord(msg) {
@@ -137,580 +103,293 @@ async function discord(msg) {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ content: msg.slice(0,1990) }),
     });
-  } catch(e) { log('ERROR',`Discord: ${e.message}`); }
+  } catch(e) {}
 }
 
-// ── SIGNAL STATE ──────────────────────────────────────────────
-// key: "BTC::YES" → { traders: Set, firstSeen: ts, lastAlerted: ts }
-const signalState = new Map();
-const alertedThisWindow = new Set(); // prevent duplicate alerts per window
+// ── KALSHI AUTH ───────────────────────────────────────────────
+function kalshiHeaders(method, urlPath) {
+  const ts  = Date.now().toString();
+  const key = CONFIG.kalshiSecret;
+  const id  = CONFIG.kalshiKey;
+  if(!key || !id) return { 'Content-Type':'application/json' };
 
-// ── KALSHI WINDOW DETECTION ───────────────────────────────────
-// Returns true if we're in the last N minutes before a :00/:15/:30/:45
-function inKalshiAlertWindow() {
-  const now     = new Date();
-  const minutes = now.getMinutes();
-  const secs    = now.getSeconds();
-  const mod     = minutes % 15; // 0-14, where 0=settlement, 10-14=alert window
-  const totalSecs = mod * 60 + secs;
-  const windowStart = (15 - CONFIG.kalshiWindowMin) * 60; // e.g. 10:00 for 5min window
-  return totalSecs >= windowStart;
-}
-
-// Returns seconds until next Kalshi settlement
-function secsToNextSettlement() {
-  const now   = new Date();
-  const mod   = now.getMinutes() % 15;
-  const secs  = now.getSeconds();
-  return (15 - mod) * 60 - secs;
-}
-
-// Returns the next settlement time string e.g. "1:15 PM"
-function nextSettlementTime() {
-  const now  = new Date();
-  const mod  = now.getMinutes() % 15;
-  const next = new Date(now.getTime() + secsToNextSettlement()*1000);
-  return next.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
-}
-
-// ── KALSHI MARKET LOOKUP ──────────────────────────────────────
-const kalshiCache = new Map(); // coin → { ticker, price, title }
-
-async function fetchKalshiMarket(coin) {
-  if(!CONFIG.kalshiKey) return null;
   try {
-    const r = await fetch(
-      `${CONFIG.kalshiUrl}/trade-api/v2/markets?status=open&search=${coin}+15&limit=50`,
-      { headers:{ 'Authorization':`Bearer ${CONFIG.kalshiKey}`, 'Accept':'application/json' } }
-    );
-    if(!r.ok) return null;
-    const d = await r.json();
-    const markets = (d.markets||[]).filter(m => {
-      const t = (m.title||'').toUpperCase();
-      return t.includes(coin) && (t.includes('15') || t.includes('MIN'));
-    });
-    if(!markets.length) return null;
-
-    // Pick the one settling soonest
-    const best = markets[0];
-    const detail = await fetch(
-      `${CONFIG.kalshiUrl}/trade-api/v2/markets/${best.ticker}`,
-      { headers:{ 'Authorization':`Bearer ${CONFIG.kalshiKey}`, 'Accept':'application/json' } }
-    );
-    if(!detail.ok) return { ticker: best.ticker, title: best.title, price: null };
-    const dd = await detail.json();
+    const msg = ts + method.toUpperCase() + urlPath.split('?')[0];
+    const sig = crypto.createSign('SHA256');
+    sig.update(msg);
+    const signature = sig.sign({
+      key: key,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    }, 'base64');
     return {
-      ticker: best.ticker,
-      title:  best.title,
-      price:  dd.market?.yes_ask || dd.market?.last_price || null,
+      'Content-Type':           'application/json',
+      'KALSHI-ACCESS-KEY':      id,
+      'KALSHI-ACCESS-TIMESTAMP': ts,
+      'KALSHI-ACCESS-SIGNATURE': signature,
     };
   } catch(e) {
-    log('ERROR',`Kalshi lookup ${coin}: ${e.message}`);
-    return null;
+    log('ERROR', `Auth sign failed: ${e.message}`);
+    return { 'Content-Type':'application/json' };
   }
 }
 
-// ── KALSHI ORDER PLACEMENT ───────────────────────────────────
+// ── GET ACTIVE KALSHI MARKET ──────────────────────────────────
+const marketCache = new Map(); // series → { ticker, yesAsk, yesBid }
 
-function signKalshiRequest(method, path, timestamp, privateKeyPem) {
-  // Kalshi requires RSA-PSS SHA256 signature
-  // Sign: timestamp + method + path (no query params)
-  const message = timestamp + method.toUpperCase() + path;
+async function getActiveTicker(series) {
   try {
-    const sign = crypto.createSign('SHA256');
-    sign.update(message);
-    sign.end();
-    // RSA-PSS padding
-    const sig = sign.sign({
-      key:               privateKeyPem,
-      padding:           crypto.constants.RSA_PKCS1_PSS_PADDING,
-      saltLength:        crypto.constants.RSA_PSS_SALTLEN_DIGEST,
-    });
-    return sig.toString('base64');
+    const r = await fetch(
+      `${CONFIG.kalshiBase}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=5`
+    );
+    if(!r.ok) return null;
+    const d  = await r.json();
+    const ms = d.markets || [];
+    if(!ms.length) return null;
+
+    const now = Math.floor(Date.now()/1000);
+    // Find soonest closing market
+    const sorted = ms
+      .map(m => {
+        const ct = m.close_time;
+        const t  = ct ? (typeof ct==='string'
+          ? Math.floor(new Date(ct).getTime()/1000)
+          : parseInt(ct) > 1e10 ? Math.floor(parseInt(ct)/1000) : parseInt(ct)) : 0;
+        return { ticker: m.ticker, closeTime: t, yesAsk: m.yes_ask, yesBid: m.yes_bid, lastPrice: m.last_price };
+      })
+      .filter(m => m.closeTime > now - 60)
+      .sort((a,b) => a.closeTime - b.closeTime);
+
+    return sorted[0] || { ticker: ms[0].ticker, yesAsk: ms[0].yes_ask, yesBid: ms[0].yes_bid };
   } catch(e) {
-    log('ERROR', `Kalshi signing failed: ${e.message}`);
+    log('ERROR', `getActiveTicker(${series}): ${e.message}`);
     return null;
   }
 }
 
-function kalshiAuthHeaders(method, urlPath) {
-  const timestamp = Date.now().toString();
-  const privateKey = process.env.KALSHI_PRIVATE_KEY || '';
-  const apiKeyId   = process.env.KALSHI_API_KEY     || '';
-
-  if(!privateKey || !apiKeyId) return null;
-
-  const sig = signKalshiRequest(method, urlPath, timestamp, privateKey);
-  if(!sig) return null;
-
-  return {
-    'Content-Type':           'application/json',
-    'KALSHI-ACCESS-KEY':      apiKeyId,
-    'KALSHI-ACCESS-SIGNATURE': sig,
-    'KALSHI-ACCESS-TIMESTAMP': timestamp,
-  };
+async function refreshMarkets() {
+  for(const [coin, series] of Object.entries(CONFIG.SERIES)) {
+    const m = await getActiveTicker(series);
+    if(m) {
+      marketCache.set(series, m);
+      log('INFO', `✅ ${coin}: ${m.ticker} | YES ask:${m.yesAsk||'?'}¢ bid:${m.yesBid||'?'}¢`);
+    } else {
+      log('WARN', `No active market for ${coin} (${series})`);
+    }
+  }
+  log('INFO', `Markets loaded: ${marketCache.size}/${Object.keys(CONFIG.SERIES).length}`);
 }
 
-async function placeKalshiOrder(ticker, side, sizeUsd, currentPrice) {
+// ── PLACE ORDER ───────────────────────────────────────────────
+async function placeOrder(ticker, side, priceCents, sizeUsd, copiedFrom) {
   const orderPath = '/trade-api/v2/portfolio/orders';
-  const headers   = kalshiAuthHeaders('POST', orderPath);
+  const contracts = Math.max(1, Math.floor(sizeUsd / (priceCents / 100)));
+  const orderId   = crypto.randomUUID();
 
-  if(!headers) {
-    log('ERROR', 'Cannot place order — missing KALSHI_API_KEY or KALSHI_PRIVATE_KEY');
-    return null;
-  }
-
-  // Calculate contracts — each contract costs `price` cents
-  // sizeUsd e.g. $5, price e.g. 0.74 = 74 cents = $0.74 per contract
-  const pricePerContract = currentPrice || 0.5;
-  const contracts = Math.max(1, Math.floor(sizeUsd / pricePerContract));
-  const limitPrice = Math.round(pricePerContract * 100) / 100; // round to 2dp
-
-  const orderId = crypto.randomUUID();
   const body = {
-    ticker:           ticker,
-    client_order_id:  orderId,
-    side:             side === 'YES' ? 'yes' : 'no',
-    count:            contracts,
-    price:            limitPrice.toFixed(2),
-    time_in_force:    'fill_or_kill', // fast execution, cancel if not filled immediately
-    type:             'limit',
+    ticker,
+    client_order_id: orderId,
+    action: 'buy',
+    side:   side.toLowerCase(),
+    count:  contracts,
+    type:   'limit',
+    time_in_force: 'fill_or_kill',
   };
+  if(side.toLowerCase() === 'yes') body.yes_price = priceCents;
+  else                              body.no_price  = priceCents;
 
-  log('INFO', `Placing Kalshi order: ${ticker} ${side} | ${contracts} contracts @ $${limitPrice} | ~$${sizeUsd}`);
+  log('INFO', `Placing order: ${ticker} ${side} ${contracts}x @ ${priceCents}¢ (~$${sizeUsd})`);
 
   try {
-    const r = await fetch(`${CONFIG.kalshiUrl}${orderPath}`, {
-      method:  'POST',
-      headers,
-      body:    JSON.stringify(body),
+    const r = await fetch(`${CONFIG.kalshiBase}${orderPath}`, {
+      method: 'POST',
+      headers: kalshiHeaders('POST', orderPath),
+      body: JSON.stringify(body),
     });
-
     const d = await r.json();
-
     if(!r.ok) {
-      log('ERROR', `Kalshi order failed ${r.status}: ${JSON.stringify(d)}`);
+      log('ERROR', `Order failed ${r.status}: ${JSON.stringify(d)}`);
       return null;
     }
 
     const order = d.order || d;
-    log('INFO', `✅ Kalshi order placed: ${order.order_id || orderId} | ${ticker} ${side} | ${contracts} contracts`);
+    log('INFO', `✅ Order placed: ${order.order_id || orderId}`);
+
+    // Record in DB
+    insertOurTrade.run({
+      id:          orderId,
+      ticker,
+      side,
+      entry_price: priceCents,
+      count:       contracts,
+      size_usd:    sizeUsd,
+      opened_at:   Math.floor(Date.now()/1000),
+      copied_from: copiedFrom,
+    });
+
     return order;
   } catch(e) {
-    log('ERROR', `placeKalshiOrder: ${e.message}`);
+    log('ERROR', `placeOrder: ${e.message}`);
     return null;
   }
 }
 
-// ── PROCESS A TRADE ───────────────────────────────────────────
-async function processTrade(trade) {
-  const { maker, taker, asset_id, price, size, side, id, timestamp } = trade;
+// ── TRADE PROCESSOR ───────────────────────────────────────────
+// Called when we see a trade on a Kalshi 15-min market
+// Decides whether to copy it based on trader win rate
 
-  // Determine trader address — could be maker or taker
-  const trader = TOP_TRADERS.has(maker) ? maker
-               : TOP_TRADERS.has(taker) ? taker
-               : null;
-  if(!trader) return; // not a top trader
+const recentlyCopied = new Map(); // ticker+side → timestamp, prevent duplicate copies
 
-  // Determine coin from asset context (set by market subscription)
-  const coin = trade._coin;
+async function onKalshiTrade(trade) {
+  const { market_ticker, member_id, yes_price, no_price, count, action, created_time } = trade;
+  if(!member_id || action !== 'buy') return;
+
+  // Figure out which series this belongs to
+  let coin = null;
+  for(const [c, series] of Object.entries(CONFIG.SERIES)) {
+    if(market_ticker.startsWith(series.replace('15M',''))) { coin = c; break; }
+    if(market_ticker.includes(c)) { coin = c; break; }
+  }
   if(!coin) return;
 
-  // Parse side — on Polymarket YES buy = price > 0.5 typically
-  const tradeSide = side === 'BUY' ? 'YES' : 'NO';
+  const series  = CONFIG.SERIES[coin];
+  const priceCents = yes_price || no_price;
+  const side    = yes_price ? 'yes' : 'no';
+  const ts      = Math.floor(Date.now()/1000);
 
-  // Filter tiny trades
-  const sizeUsd = parseFloat(price||0) * parseFloat(size||0) * 100;
-  if(sizeUsd < CONFIG.minTradeUsd) return;
-
-  const ts = timestamp ? Math.floor(new Date(timestamp).getTime()/1000) : Math.floor(Date.now()/1000);
-
-  // Store trade
-  insertTrade.run({ id: id||`${trader}-${ts}-${Math.random()}`, trader, coin, side:tradeSide, price:parseFloat(price||0), size_usd:sizeUsd, ts });
-
-  log('TRADE', `TOP TRADER ${trader.slice(0,10)}... | ${coin} ${tradeSide} | $${sizeUsd.toFixed(0)} @ ${(parseFloat(price||0)*100).toFixed(1)}¢`);
-
-  // Update signal state
-  const key = `${coin}::${tradeSide}`;
-  if(!signalState.has(key)) {
-    signalState.set(key, { traders: new Set(), firstSeen: ts });
-  }
-  const state = signalState.get(key);
-  state.traders.add(trader);
-  state.lastTrade = ts;
-
-  // Check for signal
-  const now = Math.floor(Date.now()/1000);
-  const age = now - state.firstSeen;
-
-  // Clean old traders (outside time window)
-  if(age > CONFIG.windowSecs) {
-    state.traders.clear();
-    state.firstSeen = ts;
-    state.traders.add(trader);
-  }
-
-  const traderCount = state.traders.size;
-  log('INFO', `Signal state ${key}: ${traderCount}/${CONFIG.minTraders} traders in window`);
-
-  if(traderCount >= CONFIG.minTraders) {
-    // Check if in Kalshi alert window
-    if(!inKalshiAlertWindow()) {
-      log('INFO', `Signal ${key} has ${traderCount} traders but NOT in Kalshi window yet (${Math.round(secsToNextSettlement()/60)}m to settlement)`);
-      return;
-    }
-
-    // Prevent duplicate alerts for same coin+side in same Kalshi window
-    const windowKey = `${key}::${Math.floor(now/900)}`; // 900s = 15min window
-    if(alertedThisWindow.has(windowKey)) {
-      log('INFO', `Already alerted ${key} this window`);
-      return;
-    }
-    alertedThisWindow.add(windowKey);
-
-    // Fire signal!
-    await fireSignal(coin, tradeSide, state.traders, ts);
-
-    // Reset state for this pair after firing
-    state.traders.clear();
-    state.firstSeen = ts;
-  }
-}
-
-// ── FIRE SIGNAL ───────────────────────────────────────────────
-async function fireSignal(coin, side, traders, ts) {
-  const secsLeft  = secsToNextSettlement();
-  const settleAt  = nextSettlementTime();
-  const traderArr = [...traders];
-
-  log('SIGNAL', `🎯 SIGNAL: ${coin} ${side} | ${traderArr.length} traders | ${secsLeft}s to ${settleAt}`);
-
-  // Look up active Kalshi market for this coin
-  let kalshiInfo = kalshiMarkets.get(coin);
-  if(!kalshiInfo) {
-    kalshiInfo = await getActiveKalshiMarket(coin);
-    if(kalshiInfo) kalshiMarkets.set(coin, kalshiInfo);
-  }
-
-  const kalshiTicker = kalshiInfo?.ticker || `${coin}-15MIN`;
-  const kalshiPrice  = kalshiInfo?.yesAsk ? kalshiInfo.yesAsk / 100 : null;
-  const kalshiTitle  = kalshiInfo?.ticker || `${coin} 15-min market`;
-
-  // Store signal
-  insertSignal.run({
-    coin, side,
-    traders:      JSON.stringify(traderArr),
-    trader_count: traderArr.length,
-    kalshi_ticker: kalshiTicker,
-    kalshi_price:  kalshiPrice,
-    fired_at:      Math.floor(Date.now()/1000),
-    window_end:    Math.floor(Date.now()/1000) + secsLeft,
+  // Record this trader
+  upsertTrader.run({ member_id, last_seen: ts });
+  insertMarketTrade.run({
+    id:        `${member_id}-${ts}-${Math.random()}`,
+    member_id,
+    ticker:    market_ticker,
+    side,
+    price:     priceCents,
+    count:     count || 1,
+    ts,
   });
 
-  // Discord alert
-  const priceStr = kalshiPrice ? `${(kalshiPrice*100).toFixed(1)}¢` : 'check app';
-  const urgency  = secsLeft < 120 ? '🚨 URGENT' : '🎯 SIGNAL';
+  // Get trader stats
+  const stats  = getTrader.get(member_id);
+  const total  = (stats?.wins||0) + (stats?.losses||0);
+  const winRate = total >= CONFIG.MIN_TRADES ? (stats.wins / total) : null;
+
+  log('INFO',
+    `Trade: ${coin} ${side} @ ${priceCents}¢ | trader:${member_id.slice(0,12)} | ` +
+    `${total} trades, WR:${winRate !== null ? (winRate*100).toFixed(0)+'%' : 'new'}`
+  );
+
+  // Skip price extremes
+  if(priceCents > CONFIG.MAX_COPY_PRICE * 100 || priceCents < CONFIG.MIN_COPY_PRICE * 100) {
+    log('INFO', `  Skipping — price ${priceCents}¢ outside range`);
+    return;
+  }
+
+  // Copy if win rate is good enough OR if they're new (give benefit of doubt)
+  const shouldCopy = winRate === null || winRate >= CONFIG.MIN_WIN_RATE;
+  if(!shouldCopy) {
+    log('INFO', `  Skipping — WR ${(winRate*100).toFixed(0)}% below ${CONFIG.MIN_WIN_RATE*100}%`);
+    return;
+  }
+
+  // Prevent copying same ticker+side twice within 60s
+  const copyKey = `${market_ticker}::${side}`;
+  const lastCopy = recentlyCopied.get(copyKey) || 0;
+  if(ts - lastCopy < 60) {
+    log('INFO', `  Skipping — already copied ${copyKey} ${ts-lastCopy}s ago`);
+    return;
+  }
+  recentlyCopied.set(copyKey, ts);
+
+  // Place our order
+  const label = winRate !== null
+    ? `${(winRate*100).toFixed(0)}% WR over ${total} trades`
+    : `new trader`;
+
+  log('INFO', `  🎯 COPYING: ${coin} ${side} @ ${priceCents}¢ (${label})`);
 
   await discord([
-    `${urgency} — **${coin} ${side}** on Kalshi`,
+    `🎯 **COPYING TRADE — ${coin.toUpperCase()} ${side.toUpperCase()}**`,
     `━━━━━━━━━━━━━━━━━━━━`,
-    `📊 **${traderArr.length}** top-100 Polymarket traders bought **${coin} ${side}**`,
-    `⏱  **${secsLeft}s left** before Kalshi settles at **${settleAt}**`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `🎯 **Kalshi market:** ${kalshiTitle}`,
-    `📋 **Ticker:** \`${kalshiTicker}\``,
-    `💰 **Current YES price:** ${priceStr}`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `👉 **Buy ${side} on Kalshi NOW** — ${secsLeft}s window`,
-    `🔗 https://kalshi.com/markets/${kalshiTicker.toLowerCase()}`,
+    `📊 Market: **${market_ticker}**`,
+    `💰 Price: **${priceCents}¢**`,
+    `👤 Trader: \`${member_id.slice(0,16)}\` | **${label}**`,
+    `💸 Our bet: **$${CONFIG.ORDER_SIZE_USD}**`,
   ].join('\n'));
 
-  log('SIGNAL', `Alert fired: ${coin} ${side} → ${kalshiTicker} | ${secsLeft}s left`);
-
-  // ── PLACE REAL ORDER ON KALSHI ──────────────────────────────
-  const ORDER_SIZE_USD = parseFloat(process.env.ORDER_SIZE_USD) || 5;
-  const order = await placeKalshiOrder(kalshiTicker, side, ORDER_SIZE_USD, kalshiPrice);
+  const order = await placeOrder(market_ticker, side, priceCents, CONFIG.ORDER_SIZE_USD, member_id);
 
   if(order) {
     await discord([
-      `✅ **ORDER PLACED — ${coin} ${side}**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `🎯 **${kalshiTicker}** | **${side}**`,
-      `💸 Size: **~$${ORDER_SIZE_USD}** | Price: **${kalshiPrice ? (kalshiPrice*100).toFixed(1)+'¢' : 'market'}**`,
-      `🆔 Order ID: \`${order.order_id || 'submitted'}\``,
-      `⏱  **${secsLeft}s** until settlement`,
+      `✅ **ORDER PLACED — ${coin.toUpperCase()} ${side.toUpperCase()}**`,
+      `🎯 **${market_ticker}** | ${priceCents}¢ | $${CONFIG.ORDER_SIZE_USD}`,
+      `🆔 \`${order.order_id || 'submitted'}\``,
     ].join('\n'));
   } else {
-    await discord([
-      `❌ **ORDER FAILED — ${coin} ${side}**`,
-      `Could not place order on Kalshi — check logs`,
-      `Manual entry: https://kalshi.com/markets/${kalshiTicker.toLowerCase()}`,
-    ].join('\n'));
+    await discord(`❌ **ORDER FAILED** — ${market_ticker} ${side} — check logs`);
   }
 }
 
-// ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
-// ── KALSHI SERIES TICKERS ────────────────────────────────────
-const KALSHI_SERIES = {
-  BTC:  process.env.KALSHI_SERIES_BTC  || 'KXBTC15M',
-  ETH:  process.env.KALSHI_SERIES_ETH  || 'KXETH15M',
-  SOL:  process.env.KALSHI_SERIES_SOL  || 'KXSOL15M',
-  XRP:  process.env.KALSHI_SERIES_XRP  || 'KXXRP15M',
-  DOGE: process.env.KALSHI_SERIES_DOGE || 'KXDOGE15M',
-};
+// ── WEBSOCKET — KALSHI MARKET DATA ───────────────────────────
+// Subscribe to all 15-min crypto tickers
+// Kalshi WS is public for market data — no auth needed
 
-// Coin name → Polymarket URL slug prefix
-const COIN_SLUGS = {
-  BTC:  'bitcoin',
-  ETH:  'ethereum',
-  SOL:  'solana',
-  XRP:  'xrp',
-  DOGE: 'dogecoin',
-};
-
-// ── GENERATE CURRENT 5-MIN SLUG ───────────────────────────────
-// Polymarket URL format: /event/bitcoin-up-or-down-june-7-10-00pm-10-05pm-et
-// We generate this from current UTC time converted to ET
-function currentPolySlug(coinName) {
-  const now    = new Date();
-  // Convert UTC to ET (UTC-4 EDT, UTC-5 EST — use UTC-4 for summer)
-  const etMs   = now.getTime() - (4 * 60 * 60 * 1000);
-  const et     = new Date(etMs);
-  const h      = et.getUTCHours();
-  const m      = et.getUTCMinutes();
-  const day    = et.getUTCDate();
-  const month  = et.getUTCMonth(); // 0-indexed
-
-  const MONTHS = ['january','february','march','april','may','june',
-                  'july','august','september','october','november','december'];
-
-  // Round DOWN to nearest 5-min window
-  const startMin = Math.floor(m / 5) * 5;
-  const endMin   = startMin + 5;
-  const startH   = h;
-  const endH     = endMin >= 60 ? h + 1 : h;
-  const endMinN  = endMin >= 60 ? 0 : endMin;
-
-  const fmt = (hh, mm) => {
-    const sfx  = hh < 12 ? 'am' : 'pm';
-    const h12  = hh % 12 === 0 ? 12 : hh % 12;
-    return `${h12}-${String(mm).padStart(2,'0')}${sfx}`;
-  };
-
-  return `${coinName}-up-or-down-${MONTHS[month]}-${day}-${fmt(startH,startMin)}-${fmt(endH,endMinN)}-et`;
-}
-
-// ── FETCH TODAY'S POLYMARKET TOKEN IDs ────────────────────────
-// Real Polymarket 5-min slugs use Unix timestamps: btc-updown-5m-1769431200
-// We search by market title text using the Gamma /markets endpoint
-// No auth required — Gamma API is fully public
-async function fetchPolyMarkets() {
-  const markets  = [];
-  const coinKeys = Object.keys(COIN_SLUGS);
-
-  // Search for each coin's active 5-min markets
-  for(const coin of coinKeys) {
-    try {
-      // Search by title keywords — Gamma supports text search
-      const coinName = COIN_SLUGS[coin]; // 'bitcoin', 'ethereum', etc
-      const r = await fetch(
-        `${CONFIG.POLY_REST}/markets?active=true&closed=false&limit=20&tag_slug=crypto`,
-        { headers: { 'Accept': 'application/json' } }
-      );
-      if(!r.ok){ log('WARN', `Gamma ${r.status} for ${coin}`); continue; }
-
-      const d     = await r.json();
-      const items = Array.isArray(d) ? d : (d.markets || d.data || []);
-
-      // Filter to this coin's 5-min "up or down" markets
-      const coinMatches = items.filter(m => {
-        const t = (m.question || m.title || '').toLowerCase();
-        return t.includes(coinName) && t.includes('up or down');
-      });
-
-      if(!coinMatches.length) continue;
-
-      // Pick the most recently created / soonest ending one
-      const best = coinMatches[0];
-      const clobRaw  = best.clobTokenIds;
-      const clobIds  = clobRaw
-        ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw)
-        : null;
-      const yesTokenId = clobIds?.[0];
-      const noTokenId  = clobIds?.[1];
-      if(!yesTokenId) continue;
-
-      const title = best.question || best.title || coin;
-      markets.push({ coin, title, conditionId: best.conditionId || best.condition_id, yesTokenId, noTokenId, marketId: best.id });
-      log('INFO', `✅ Poly ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
-
-    } catch(e) {
-      log('WARN', `fetchPolyMarkets ${coin}: ${e.message}`);
-    }
-    await new Promise(r => setTimeout(r, 150));
-  }
-
-  // If tag_slug approach gave nothing, try the events endpoint
-  if(markets.length === 0) {
-    log('INFO', 'tag_slug gave 0 — trying events search...');
-    try {
-      const r = await fetch(
-        `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=100`,
-        { headers: { 'Accept': 'application/json' } }
-      );
-      if(r.ok) {
-        const d     = await r.json();
-        const items = Array.isArray(d) ? d : (d.events || d.data || []);
-        const COIN_NAMES = {
-          BTC: ['bitcoin'], ETH: ['ethereum'], SOL: ['solana'],
-          XRP: ['xrp'], DOGE: ['dogecoin','doge'],
-        };
-        for(const item of items) {
-          for(const m of (item.markets || [item])) {
-            const t = (m.question || m.title || item.title || '').toLowerCase();
-            if(!t.includes('up or down')) continue;
-            let coin = null;
-            for(const [c, names] of Object.entries(COIN_NAMES)){
-              if(names.some(n => t.includes(n))){ coin = c; break; }
-            }
-            if(!coin) continue;
-            if(markets.find(x => x.coin === coin)) continue; // already have this coin
-            const clobRaw = m.clobTokenIds;
-            const clobIds = clobRaw ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw) : null;
-            const yesTokenId = clobIds?.[0];
-            if(!yesTokenId) continue;
-            const title = m.question || m.title || item.title || '';
-            markets.push({ coin, title, conditionId: m.conditionId||m.condition_id, yesTokenId, noTokenId: clobIds?.[1], marketId: m.id });
-            log('INFO', `✅ Poly ${coin} (events): ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
-          }
-        }
-      }
-    } catch(e) { log('WARN', `events fallback: ${e.message}`); }
-  }
-
-  log('INFO', `Polymarket markets found: ${markets.length}/${coinKeys.length}`);
-  return markets;
-}
-
-// ── KALSHI MARKET LOOKUP ──────────────────────────────────────
-async function getActiveKalshiMarket(coin) {
-  const series = KALSHI_SERIES[coin];
-  if(!series) return null;
-  try {
-    const r = await fetch(
-      `${CONFIG.kalshiUrl}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=10`
-    );
-    if(!r.ok) return null;
-    const d       = await r.json();
-    const markets = d.markets || [];
-    if(!markets.length) return null;
-
-    const now    = Math.floor(Date.now()/1000);
-    const future = markets.map(m => {
-      const ct = m.close_time;
-      const t  = ct
-        ? (typeof ct === 'string'
-            ? Math.floor(new Date(ct).getTime()/1000)
-            : parseInt(ct) > 1e10 ? Math.floor(parseInt(ct)/1000) : parseInt(ct))
-        : 0;
-      return { ticker: m.ticker, closeTime: t, yesAsk: m.yes_ask, yesBid: m.yes_bid };
-    }).filter(m => m.closeTime >= now - 30);
-
-    if(!future.length) return { ticker: markets[0].ticker, yesAsk: markets[0].yes_ask };
-    future.sort((a,b) => a.closeTime - b.closeTime);
-    return future[0];
-  } catch(e) {
-    log('ERROR', `getActiveKalshiMarket(${coin}): ${e.message}`);
-    return null;
-  }
-}
-
-const kalshiMarkets = new Map();
-
-async function refreshKalshiMarkets() {
-  log('INFO', 'Refreshing Kalshi 15-min markets...');
-  for(const coin of Object.keys(KALSHI_SERIES)) {
-    const m = await getActiveKalshiMarket(coin);
-    if(m) {
-      kalshiMarkets.set(coin, m);
-      log('INFO', `✅ Kalshi ${coin}: ${m.ticker} | YES ask: ${m.yesAsk ? m.yesAsk+'¢' : '?'}`);
-    }
-  }
-  log('INFO', `Kalshi markets loaded: ${kalshiMarkets.size}/${Object.keys(KALSHI_SERIES).length}`);
-}
-
-
-// ── WEBSOCKET ─────────────────────────────────────────────────
 let ws = null;
-let wsMarkets = [];
 
-function connectWebSocket(markets) {
-  wsMarkets = markets;
-  log('INFO', `Connecting to Polymarket WebSocket...`);
+function connectKalshiWS() {
+  const wsUrl = `${CONFIG.kalshiBase.replace('https','wss').replace('http','ws')}/trade-api/ws/v2`;
+  log('INFO', `Connecting to Kalshi WebSocket: ${wsUrl}`);
 
-  ws = new WebSocket(CONFIG.POLY_WS);
+  ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
-    log('INFO', '✅ Polymarket WebSocket connected');
+    log('INFO', '✅ Kalshi WebSocket connected');
 
-    // Subscribe to all market token IDs
-    const assetIds = markets
-      .flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean))
-      .slice(0, 200); // WS limit
+    // Subscribe to fills (trades) on all series
+    const tickers = Object.values(marketCache)
+      .map(m => m.ticker)
+      .filter(Boolean);
 
-    if(assetIds.length === 0) {
-      log('WARN', 'No asset IDs yet — WebSocket open, will subscribe when markets load');
-      // Still keep WS open — we'll reconnect with IDs after market refresh
+    if(!tickers.length) {
+      log('WARN', 'No market tickers yet — will resubscribe after market refresh');
       return;
     }
 
-    ws.send(JSON.stringify({
-      auth:    {},
-      type:    'Market',
-      markets: [],
-      assets:  assetIds,
-    }));
-
-    log('INFO', `Subscribed to ${assetIds.length} market token IDs`);
+    // Subscribe to trade feed for each market
+    for(const ticker of tickers) {
+      ws.send(JSON.stringify({
+        id:   ticker,
+        cmd:  'subscribe',
+        params: {
+          channels: ['trade'],
+          market_tickers: [ticker],
+        },
+      }));
+    }
+    log('INFO', `Subscribed to trade feed for ${tickers.length} markets: ${tickers.join(', ')}`);
   });
 
   ws.on('message', async (raw) => {
     try {
-      const events = JSON.parse(raw.toString());
-      const list   = Array.isArray(events) ? events : [events];
+      const msg = JSON.parse(raw.toString());
 
-      for(const event of list) {
-        if(event.event_type !== 'trade') continue;
+      // Handle trade events
+      if(msg.type === 'trade' || msg.channel === 'trade') {
+        const data = msg.msg || msg.data || msg;
+        if(data.market_ticker) {
+          await onKalshiTrade(data);
+        }
+      }
 
-        // Find which market this trade belongs to
-        const market = wsMarkets.find(m =>
-          m.yesTokenId === event.asset_id ||
-          m.noTokenId  === event.asset_id
-        );
-        if(!market) continue;
-
-        // Check if either side is a top trader
-        const isTopMaker = TOP_TRADERS.has(event.maker_address);
-        const isTopTaker = TOP_TRADERS.has(event.taker_address);
-        if(!isTopMaker && !isTopTaker) continue;
-
-        const side = (market.yesTokenId === event.asset_id) ? 'BUY' : 'SELL';
-
-        await processTrade({
-          id:        event.id,
-          maker:     event.maker_address,
-          taker:     event.taker_address,
-          asset_id:  event.asset_id,
-          price:     event.price,
-          size:      event.size,
-          side,
-          timestamp: event.timestamp,
-          _coin:     market.coin,
-        });
+      // Handle orderbook/ticker snapshots — extract recent trades
+      if(msg.type === 'fills' || msg.channel === 'fills') {
+        const fills = msg.msg?.fills || msg.data?.fills || [];
+        for(const fill of fills) {
+          await onKalshiTrade({ ...fill, action: 'buy' });
+        }
       }
     } catch(e) {
-      // Polymarket sometimes sends plain text like "INVALID OPERATION" — ignore
-      if(!e.message.includes('not valid JSON') && !e.message.includes('Unexpected token')) {
+      if(!e.message.includes('JSON')) {
         log('ERROR', `WS message: ${e.message}`);
       }
     }
@@ -720,136 +399,161 @@ function connectWebSocket(markets) {
 
   ws.on('close', (code) => {
     log('INFO', `WS closed (${code}) — reconnecting in 5s`);
-    setTimeout(() => connectWebSocket(wsMarkets), 5000);
+    setTimeout(connectKalshiWS, 5000);
   });
 
-  // Keepalive ping every 30s
+  // Keepalive
   setInterval(() => {
     if(ws?.readyState === WebSocket.OPEN) ws.ping();
-  }, 30000);
+  }, 20000);
+}
+
+// ── POLL RECENT KALSHI TRADES (FALLBACK) ─────────────────────
+// In case WebSocket misses trades, poll the public trades endpoint
+// GET /trade-api/v2/markets/{ticker}/trades — NO auth needed
+
+async function pollKalshiTrades() {
+  for(const [coin, series] of Object.entries(CONFIG.SERIES)) {
+    const market = marketCache.get(series);
+    if(!market?.ticker) continue;
+
+    try {
+      const r = await fetch(
+        `${CONFIG.kalshiBase}/trade-api/v2/markets/${market.ticker}/trades?limit=10`
+      );
+      if(!r.ok) continue;
+      const d      = await r.json();
+      const trades = d.trades || [];
+      const cutoff = Math.floor(Date.now()/1000) - 90; // last 90 seconds
+
+      for(const t of trades) {
+        const ts = t.created_time
+          ? Math.floor(new Date(t.created_time).getTime()/1000)
+          : 0;
+        if(ts < cutoff) continue;
+        await onKalshiTrade({ ...t, market_ticker: market.ticker });
+      }
+    } catch(e) {
+      log('WARN', `pollKalshiTrades(${coin}): ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+
+// ── SETTLE OPEN TRADES ────────────────────────────────────────
+// Check if any of our open trades have resolved and calculate PnL
+
+async function settleOpenTrades() {
+  const open = getOpenTrades.all();
+  if(!open.length) return;
+
+  for(const trade of open) {
+    try {
+      const r = await fetch(
+        `${CONFIG.kalshiBase}/trade-api/v2/markets/${trade.ticker}`
+      );
+      if(!r.ok) continue;
+      const d = await r.json();
+      const m = d.market || d;
+
+      // Market resolved?
+      if(m.status === 'finalized' || m.status === 'settled') {
+        const wonYes = m.result === 'yes';
+        const ourSide = trade.side.toLowerCase();
+        const won = (ourSide === 'yes' && wonYes) || (ourSide === 'no' && !wonYes);
+
+        const exitPrice = won ? 100 : 0;
+        const pnl = won
+          ? (trade.count * ((100 - trade.entry_price) / 100))
+          : -(trade.count * (trade.entry_price / 100));
+
+        updateOurTrade.run({
+          id:         trade.id,
+          status:     'CLOSED',
+          closed_at:  Math.floor(Date.now()/1000),
+          exit_price: exitPrice,
+          pnl_usd:    pnl,
+        });
+
+        // Update trader win/loss record
+        if(trade.copied_from) {
+          if(won) addWin.run({ id: trade.copied_from, pnl });
+          else    addLoss.run({ id: trade.copied_from, pnl });
+        }
+
+        const sign = pnl >= 0 ? '+' : '';
+        log('INFO', `Trade settled: ${trade.ticker} ${trade.side} | ${won?'WIN':'LOSS'} | ${sign}$${pnl.toFixed(2)}`);
+
+        await discord([
+          `${won ? '✅ WIN' : '❌ LOSS'} — **${trade.ticker} ${trade.side.toUpperCase()}**`,
+          `━━━━━━━━━━━━━━━━━━━━`,
+          `📥 Entry: **${trade.entry_price}¢** | Exit: **${exitPrice}¢**`,
+          `${pnl>=0?'📈':'📉'} PnL: **${sign}$${pnl.toFixed(2)}**`,
+          `👤 Copied from: \`${(trade.copied_from||'').slice(0,16)}\``,
+        ].join('\n'));
+      }
+    } catch(e) {}
+  }
 }
 
 // ── MAIN ──────────────────────────────────────────────────────
 async function main() {
   console.log('\n╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  🎯 POLYMARKET → KALSHI SIGNAL BOT v2                        ║');
-  console.log('║  Real-time WebSocket | Top 100 traders | 15-min crypto       ║');
+  console.log('║  🎯 KALSHI COPY TRADER v3                                     ║');
+  console.log('║  Watches Kalshi trades → copies winning traders for $5        ║');
   console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
-  // Add any extra traders from env var
-  if(process.env.TRADER_ADDRESSES) {
-    const extra = process.env.TRADER_ADDRESSES.split(',').map(a=>a.trim().toLowerCase()).filter(Boolean);
-    extra.forEach(a => TOP_TRADERS.add(a));
-    log('INFO', `Loaded ${extra.length} extra traders from TRADER_ADDRESSES`);
-  }
+  log('INFO', `Copy threshold: ${CONFIG.MIN_WIN_RATE*100}% WR after ${CONFIG.MIN_TRADES} trades`);
+  log('INFO', `Order size: $${CONFIG.ORDER_SIZE_USD} | Price range: ${CONFIG.MIN_COPY_PRICE*100}-${CONFIG.MAX_COPY_PRICE*100}¢`);
+  log('INFO', `New traders: copying by default until we have data on them`);
 
-  log('INFO', `Watching ${TOP_TRADERS.size} top traders`);
-  log('INFO', `Signal: ${CONFIG.minTraders}+ traders same side within ${CONFIG.windowSecs/60}min`);
-  log('INFO', `Alert window: last ${CONFIG.kalshiWindowMin}min before Kalshi settlement`);
-  log('INFO', `Min trade size: $${CONFIG.minTradeUsd}`);
+  if(!CONFIG.kalshiKey) log('WARN', 'No KALSHI_API_KEY — will watch only, cannot place orders');
 
-  await discord(
-    `🎯 **Polymarket → Kalshi Bot ONLINE**\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Watching **${TOP_TRADERS.size}** top Polymarket crypto traders\n` +
-    `📡 Real-time WebSocket feed\n` +
-    `⚡ Signal: **${CONFIG.minTraders}+** traders same side within **${CONFIG.windowSecs/60}min**\n` +
-    `⏱  Alerts fire in **last ${CONFIG.kalshiWindowMin}min** before Kalshi settlement\n` +
-    `🪙 Coins: **${CONFIG.COINS.join(', ')}**`
-  );
+  // Load markets
+  await refreshMarkets();
 
-  // Fetch active markets
-  // Load Kalshi markets directly from series tickers
-  await refreshKalshiMarkets();
+  // Connect WebSocket
+  connectKalshiWS();
 
-  // Start WebSocket for Polymarket trade monitoring
-  // Since we watch by trader address, we don't need specific token IDs
-  connectWebSocket([]);
+  await discord([
+    `🎯 **KALSHI COPY TRADER v3 ONLINE**`,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `📊 Watching: **${Object.keys(CONFIG.SERIES).join(', ')}** 15-min markets`,
+    `🎯 Copying traders with **≥${CONFIG.MIN_WIN_RATE*100}%** WR`,
+    `💸 **$${CONFIG.ORDER_SIZE_USD}** per copy trade`,
+    `🆕 New traders: **copied by default**`,
+    `⚡ Real-time Kalshi WebSocket + polling fallback`,
+  ].join('\n'));
 
-  // Refresh markets every 5 minutes — update list WITHOUT closing WebSocket
+  // Refresh markets every 5 minutes (new windows open)
   setInterval(async () => {
-    log('INFO', 'Refreshing market list...');
-    const fresh = await fetchPolyMarkets();
-    if(fresh.length > 0) {
-      wsMarkets = fresh;
-      // Re-subscribe with new token IDs without closing the connection
-      // Close and reconnect with fresh market list
-      // (Polymarket WS doesn't support re-subscribe on same connection)
-      if(ws?.readyState === WebSocket.OPEN) {
-        log('INFO', 'Reconnecting WS with fresh market list...');
-        ws.close(1000, 'market refresh');
-        // connectWebSocket will be called automatically by the close handler
-      }
+    await refreshMarkets();
+    // Reconnect WS with updated tickers
+    if(ws?.readyState === WebSocket.OPEN) {
+      ws.close(1000, 'refresh');
     }
-    kalshiCache.clear();
-    alertedThisWindow.clear();
   }, 5 * 60 * 1000);
 
-  // ── ADAPTIVE POLLING ─────────────────────────────────────────
-  // Outside alert window: poll every 30s (light touch)
-  // Inside alert window: poll every 10s (aggressive — catch signals fast)
-  // This is the core loop that detects trader activity
+  // Poll trades every 15s as fallback
+  setInterval(pollKalshiTrades, 15 * 1000);
 
-  let lastPollTime = 0;
+  // Settle open trades every 2 minutes
+  setInterval(settleOpenTrades, 2 * 60 * 1000);
 
-  setInterval(async () => {
-    const inWindow  = inKalshiAlertWindow();
-    const secsLeft  = secsToNextSettlement();
-    const interval  = inWindow ? 10 : 30; // 10s in window, 30s outside
-    const now       = Date.now();
-
-    if((now - lastPollTime) < interval * 1000) return; // not time yet
-    lastPollTime = now;
-
-    // Polling is handled by WebSocket — this just refreshes market list in window
-    if(inWindow && wsMarkets.length === 0) {
-      log('WARN', '  WebSocket has no markets — attempting refresh...');
-      const fresh = await fetchPolyMarkets();
-      if(fresh.length > 0) {
-        wsMarkets = fresh;
-        if(ws?.readyState === WebSocket.OPEN) {
-          const ids = fresh.flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean));
-          ws.send(JSON.stringify({ auth:{}, type:'Market', markets:[], assets:ids }));
-          log('INFO', `Re-subscribed to ${ids.length} token IDs`);
-        }
-      }
-    }
-
-    // Log status every check when in window, every 5min outside
-    if(inWindow) {
-      log('INFO', `⏰ IN WINDOW | ${secsLeft}s to ${nextSettlementTime()} | Kalshi markets: ${kalshiMarkets.size}`);
-      // Log signal states so you can see progress
-      let hasState = false;
-      for(const [key, st] of signalState) {
-        if(st.traders.size > 0) {
-          log('INFO', `  📊 ${key}: ${st.traders.size}/${CONFIG.minTraders} traders`);
-          hasState = true;
-        }
-      }
-      if(!hasState) log('INFO', `  No trader signals yet this window`);
-    }
-  }, 5000); // run check every 5s, but interval logic controls actual poll frequency
-
-  // Status log every 5min (outside window summary)
+  // Status every 5 minutes
   setInterval(() => {
-    if(!inKalshiAlertWindow()) {
-      const secsLeft = secsToNextSettlement();
-      log('INFO', `Status | Next window: ${nextSettlementTime()} in ${Math.floor(secsLeft/60)}m${secsLeft%60}s | Kalshi: ${kalshiMarkets.size} markets`);
-    }
+    const open = getOpenTrades.all();
+    log('INFO', `Status | Open trades: ${open.length} | Markets: ${marketCache.size}/5`);
   }, 5 * 60 * 1000);
 
-  log('INFO', `✅ Bot running — LIVE ORDER MODE | $${parseFloat(process.env.ORDER_SIZE_USD)||5} per trade`);
+  log('INFO', '✅ Running — watching Kalshi trades...');
 }
 
 process.on('SIGINT', async () => {
   log('INFO', 'Shutting down...');
-  await discord('🔴 **Polymarket → Kalshi Bot OFFLINE**');
+  await discord('🔴 **Kalshi Copy Trader OFFLINE**');
   process.exit(0);
 });
 
 process.on('unhandledRejection', e => log('ERROR', `Unhandled: ${e.message}`));
-
-main().catch(e => {
-  log('ERROR', `Fatal: ${e.message}`);
-  process.exit(1);
-});
+main().catch(e => { log('ERROR', `Fatal: ${e.message}`); process.exit(1); });
