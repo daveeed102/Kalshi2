@@ -649,7 +649,12 @@ function connectWebSocket(markets) {
           _coin:     market.coin,
         });
       }
-    } catch(e) { log('ERROR', `WS message: ${e.message}`); }
+    } catch(e) {
+      // Polymarket sometimes sends plain text like "INVALID OPERATION" — ignore
+      if(!e.message.includes('not valid JSON') && !e.message.includes('Unexpected token')) {
+        log('ERROR', `WS message: ${e.message}`);
+      }
+    }
   });
 
   ws.on('error', e => log('ERROR', `WS error: ${e.message}`));
@@ -713,14 +718,12 @@ async function main() {
     if(fresh.length > 0) {
       wsMarkets = fresh;
       // Re-subscribe with new token IDs without closing the connection
+      // Close and reconnect with fresh market list
+      // (Polymarket WS doesn't support re-subscribe on same connection)
       if(ws?.readyState === WebSocket.OPEN) {
-        const newIds = fresh
-          .flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean))
-          .slice(0, 200);
-        if(newIds.length > 0) {
-          ws.send(JSON.stringify({ auth:{}, type:'Market', markets:[], assets:newIds }));
-          log('INFO', `Re-subscribed to ${newIds.length} token IDs (no reconnect needed)`);
-        }
+        log('INFO', 'Reconnecting WS with fresh market list...');
+        ws.close(1000, 'market refresh');
+        // connectWebSocket will be called automatically by the close handler
       }
     }
     kalshiCache.clear();
