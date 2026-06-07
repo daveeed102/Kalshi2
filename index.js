@@ -16,6 +16,7 @@ const crypto   = require('crypto');
 // ── CONFIG ────────────────────────────────────────────────────
 const CONFIG = {
   kalshiBase:   process.env.KALSHI_BASE_URL    || 'https://api.elections.kalshi.com',
+  kalshiPublic: 'https://external-api.kalshi.com', // public no-auth endpoint
   kalshiKey:    process.env.KALSHI_API_KEY      || '',
   kalshiSecret: process.env.KALSHI_PRIVATE_KEY  || '',
   discord:      process.env.DISCORD_WEBHOOK_URL || '',
@@ -140,7 +141,7 @@ const marketCache = new Map(); // series → { ticker, yesAsk, yesBid }
 async function getActiveTicker(series) {
   try {
     const r = await fetch(
-      `${CONFIG.kalshiBase}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=5`
+      `${CONFIG.kalshiPublic}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=5`
     );
     if(!r.ok) return null;
     const d  = await r.json();
@@ -346,20 +347,28 @@ async function pollKalshiTrades() {
     if(!market?.ticker) continue;
 
     try {
-      const url = `${CONFIG.kalshiBase}/trade-api/v2/trades?ticker=${market.ticker}&limit=20`;
-      const r   = await fetch(url);
+      // Use public external API — no auth needed, correct endpoint
+      const url = `${CONFIG.kalshiPublic}/trade-api/v2/trades?ticker=${market.ticker}&limit=50`;
+      const r   = await fetch(url, { headers: { 'Accept': 'application/json' } });
 
       if(!r.ok) {
-        log('WARN', `Poll ${coin} ${r.status}: ${market.ticker}`);
+        const body = await r.text().catch(()=>'');
+        log('WARN', `Poll ${coin} ${r.status}: ${market.ticker} — ${body.slice(0,80)}`);
         continue;
       }
 
       const d      = await r.json();
       const trades = d.trades || [];
-      const cutoff = Math.floor(Date.now()/1000) - 120; // last 2 minutes
+      const cutoff = Math.floor(Date.now()/1000) - 120;
 
       if(trades.length > 0) {
-        log('INFO', `Poll ${coin}: ${trades.length} trades found on ${market.ticker}`);
+        log('INFO', `Poll ${coin}: ${trades.length} trades on ${market.ticker}`);
+        // Log first trade structure once so we know the fields
+        if(!pollKalshiTrades._logged) {
+          log('INFO', `Trade fields: ${Object.keys(trades[0]).join(', ')}`);
+          log('INFO', `Sample: ${JSON.stringify(trades[0]).slice(0,150)}`);
+          pollKalshiTrades._logged = true;
+        }
       }
 
       for(const t of trades) {
@@ -367,8 +376,23 @@ async function pollKalshiTrades() {
           ? Math.floor(new Date(t.created_time).getTime()/1000)
           : Math.floor(Date.now()/1000);
         if(ts < cutoff) continue;
-        log('INFO', `  Raw trade: ${JSON.stringify(t).slice(0,120)}`);
-        await onKalshiTrade({ ...t, market_ticker: market.ticker });
+
+        // Normalize price — docs say yes_price_dollars e.g. "0.56"
+        // Convert to cents integer
+        let yesPriceCents = null;
+        let noPriceCents  = null;
+        if(t.yes_price)         yesPriceCents = parseInt(t.yes_price);
+        else if(t.yes_price_dollars) yesPriceCents = Math.round(parseFloat(t.yes_price_dollars) * 100);
+        if(t.no_price)          noPriceCents  = parseInt(t.no_price);
+        else if(t.no_price_dollars)  noPriceCents  = Math.round(parseFloat(t.no_price_dollars) * 100);
+
+        await onKalshiTrade({
+          ...t,
+          market_ticker: market.ticker,
+          yes_price:     yesPriceCents,
+          no_price:      noPriceCents,
+          action:        'buy',
+        });
       }
     } catch(e) {
       log('WARN', `pollKalshiTrades(${coin}): ${e.message}`);
@@ -376,6 +400,7 @@ async function pollKalshiTrades() {
     await new Promise(r => setTimeout(r, 150));
   }
 }
+pollKalshiTrades._logged = false;
 
 // ── SETTLE OPEN TRADES ────────────────────────────────────────
 // Check if any of our open trades have resolved and calculate PnL
