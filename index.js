@@ -113,24 +113,25 @@ function kalshiHeaders(method, urlPath) {
   const key = CONFIG.kalshiSecret;
   const id  = CONFIG.kalshiKey;
   if(!key || !id) return { 'Content-Type':'application/json' };
-
   try {
-    const msg = ts + method.toUpperCase() + urlPath.split('?')[0];
-    const sig = crypto.createSign('SHA256');
-    sig.update(msg);
-    const signature = sig.sign({
-      key: key,
-      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
-    }, 'base64');
-    return {
-      'Content-Type':           'application/json',
-      'KALSHI-ACCESS-KEY':      id,
-      'KALSHI-ACCESS-TIMESTAMP': ts,
-      'KALSHI-ACCESS-SIGNATURE': signature,
-    };
+    const cleanPath = urlPath.split('?')[0];
+    const msg       = ts + method.toUpperCase() + cleanPath;
+    // Railway strips newlines from env vars — rebuild proper PEM
+    let pem = key.trim();
+    const BEGIN = '-----BEGIN RSA PRIVATE KEY-----';
+    const END   = '-----END RSA PRIVATE KEY-----';
+    // Strip headers and all whitespace to get raw base64
+    let b64 = pem.replace(BEGIN,'').replace(END,'').replace(/\s+/g,'');
+    // Re-wrap at 64 chars with actual newlines
+    const lines = [];
+    for(let i=0;i<b64.length;i+=64) lines.push(b64.slice(i,i+64));
+    pem = BEGIN + '\n' + lines.join('\n') + '\n' + END;
+    const signer = crypto.createSign('SHA256');
+    signer.update(msg);
+    const signature = signer.sign({ key:pem, padding:crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength:crypto.constants.RSA_PSS_SALTLEN_DIGEST }, 'base64');
+    return { 'Content-Type':'application/json', 'KALSHI-ACCESS-KEY':id, 'KALSHI-ACCESS-TIMESTAMP':ts, 'KALSHI-ACCESS-SIGNATURE':signature };
   } catch(e) {
-    log('ERROR', `Auth sign failed: ${e.message}`);
+    log('ERROR', 'Auth sign failed: ' + e.message);
     return { 'Content-Type':'application/json' };
   }
 }
@@ -283,6 +284,18 @@ async function onKalshiTrade(trade) {
   // Skip price extremes
   if(priceCents > CONFIG.MAX_COPY_PRICE * 100 || priceCents < CONFIG.MIN_COPY_PRICE * 100) {
     log('INFO', `  Skipping — price ${priceCents}¢ outside range`);
+    return;
+  }
+
+  // Only trade in last 5 minutes before Kalshi settlement (:00, :15, :30, :45)
+  const nowDate   = new Date();
+  const minMod    = nowDate.getMinutes() % 15;
+  const secMod    = nowDate.getSeconds();
+  const secsIntoWindow = minMod * 60 + secMod;
+  const WINDOW_START   = 10 * 60; // last 5 min = from 10:00 to 15:00 in cycle
+  if(secsIntoWindow < WINDOW_START) {
+    const secsUntilWindow = WINDOW_START - secsIntoWindow;
+    log('INFO', `  Not in window — ${Math.floor(secsUntilWindow/60)}m${secsUntilWindow%60}s until alert window opens`);
     return;
   }
 
