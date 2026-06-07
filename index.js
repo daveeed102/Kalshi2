@@ -685,8 +685,42 @@ async function main() {
     if((now - lastPollTime) < interval * 1000) return; // not time yet
     lastPollTime = now;
 
-    // Poll top traders for recent trades
-    await pollRecentTrades(wsMarkets);
+    // Poll top traders for recent trades directly
+    const cutoff  = Math.floor(Date.now()/1000) - CONFIG.windowSecs;
+    const traders = [...TOP_TRADERS].slice(0, 25); // poll 25 at a time to stay fast
+    for(const trader of traders) {
+      try {
+        const r = await fetch(`${CONFIG.CLOB_REST}/trades?user=${trader}&limit=20`);
+        if(!r.ok) continue;
+        const d      = await r.json();
+        const trades = d?.data || d || [];
+        for(const t of trades) {
+          const ts = t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : 0;
+          if(ts < cutoff) continue;
+          // Match to a known Kalshi coin by market title
+          const title = (t.title || t.market_title || '').toLowerCase();
+          let coin = null;
+          if(title.includes('bitcoin') || title.includes('btc'))      coin = 'BTC';
+          else if(title.includes('ethereum') || title.includes('eth')) coin = 'ETH';
+          else if(title.includes('solana') || title.includes('sol'))   coin = 'SOL';
+          else if(title.includes('xrp') || title.includes('ripple'))   coin = 'XRP';
+          else if(title.includes('doge'))                              coin = 'DOGE';
+          if(!coin) continue;
+          if(!title.includes('up or down') && !title.includes('5')) continue;
+          const side    = (t.side||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL';
+          const sizeUsd = parseFloat(t.price||0) * parseFloat(t.size||0) * 100;
+          if(sizeUsd < CONFIG.minTradeUsd) continue;
+          await processTrade({
+            id: t.id || `${trader}-${ts}`,
+            maker: trader, taker: trader,
+            asset_id: null, price: t.price,
+            size: t.size, side, timestamp: t.timestamp,
+            _coin: coin,
+          });
+        }
+        await new Promise(r => setTimeout(r, 100));
+      } catch(e) {}
+    }
 
     // Log status every check when in window, every 5min outside
     if(inWindow) {
