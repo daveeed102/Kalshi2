@@ -17,7 +17,7 @@ const crypto    = require('crypto'); // built-in Node.js — no install needed
 const CONFIG = {
   discord:   process.env.DISCORD_WEBHOOK_URL || '',
   kalshiKey: process.env.KALSHI_API_KEY      || '',
-  kalshiUrl: process.env.KALSHI_BASE_URL     || 'https://trading-api.kalshi.com',
+  kalshiUrl: process.env.KALSHI_BASE_URL     || 'https://api.elections.kalshi.com',
 
   // Signal rules
   minTraders:      parseInt(process.env.MIN_TRADERS)      || 2,   // 2+ traders to signal
