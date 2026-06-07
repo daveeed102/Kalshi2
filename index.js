@@ -340,7 +340,28 @@ function connectKalshiWS() {
   const wsUrl = `${CONFIG.kalshiBase.replace('https','wss').replace('http','ws')}/trade-api/ws/v2`;
   log('INFO', `Connecting to Kalshi WebSocket: ${wsUrl}`);
 
-  ws = new WebSocket(wsUrl);
+  // Kalshi WS requires auth headers
+  const wsTs  = Date.now().toString();
+  const wsPath = '/trade-api/ws/v2';
+  let wsHeaders = {};
+  if(CONFIG.kalshiKey && CONFIG.kalshiSecret) {
+    try {
+      const msg = wsTs + 'GET' + wsPath;
+      const sig = crypto.createSign('SHA256');
+      sig.update(msg);
+      const signature = sig.sign({
+        key: CONFIG.kalshiSecret,
+        padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+        saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+      }, 'base64');
+      wsHeaders = {
+        'KALSHI-ACCESS-KEY':       CONFIG.kalshiKey,
+        'KALSHI-ACCESS-TIMESTAMP': wsTs,
+        'KALSHI-ACCESS-SIGNATURE': signature,
+      };
+    } catch(e) { log('ERROR', `WS auth: ${e.message}`); }
+  }
+  ws = new WebSocket(wsUrl, { headers: wsHeaders });
 
   ws.on('open', () => {
     log('INFO', '✅ Kalshi WebSocket connected');
@@ -534,8 +555,10 @@ async function main() {
     }
   }, 5 * 60 * 1000);
 
-  // Poll trades every 15s as fallback
-  setInterval(pollKalshiTrades, 15 * 1000);
+  // Poll trades every 10s — primary detection mechanism
+  setInterval(pollKalshiTrades, 10 * 1000);
+  // Also run immediately
+  setTimeout(pollKalshiTrades, 2000);
 
   // Settle open trades every 2 minutes
   setInterval(settleOpenTrades, 2 * 60 * 1000);
