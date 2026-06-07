@@ -385,16 +385,16 @@ async function fireSignal(coin, side, traders, ts) {
 
   log('SIGNAL', `🎯 SIGNAL: ${coin} ${side} | ${traderArr.length} traders | ${secsLeft}s to ${settleAt}`);
 
-  // Look up Kalshi market
-  let kalshi = kalshiCache.get(coin);
-  if(!kalshi) {
-    kalshi = await fetchKalshiMarket(coin);
-    if(kalshi) kalshiCache.set(coin, kalshi);
+  // Look up active Kalshi market for this coin
+  let kalshiInfo = kalshiMarkets.get(coin);
+  if(!kalshiInfo) {
+    kalshiInfo = await getActiveKalshiMarket(coin);
+    if(kalshiInfo) kalshiMarkets.set(coin, kalshiInfo);
   }
 
-  const kalshiTicker = kalshi?.ticker || `${coin}-15MIN`;
-  const kalshiPrice  = kalshi?.price  || null;
-  const kalshiTitle  = kalshi?.title  || `${coin} 15-min market`;
+  const kalshiTicker = kalshiInfo?.ticker || `${coin}-15MIN`;
+  const kalshiPrice  = kalshiInfo?.yesAsk ? kalshiInfo.yesAsk / 100 : null;
+  const kalshiTitle  = kalshiInfo?.ticker || `${coin} 15-min market`;
 
   // Store signal
   insertSignal.run({
@@ -450,183 +450,79 @@ async function fireSignal(coin, side, traders, ts) {
 }
 
 // ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
-// ── GENERATE TODAY'S MARKET SLUGS ────────────────────────────
-function getTodayMarketSlugs() {
-  const now    = new Date();
-  const utcH   = now.getUTCHours();
-  const utcM   = now.getUTCMinutes();
-  const offset = 4; // EDT (UTC-4)
-  let etH      = utcH - offset;
-  let etMon    = now.getUTCMonth();
-  let etDay    = now.getUTCDate();
-  if(etH < 0){ etH += 24; etDay--; }
+// ── KALSHI SERIES TICKERS ────────────────────────────────────
+// These are the permanent series IDs for Kalshi 15-min crypto markets
+// Query: GET /trade-api/v2/markets?series_ticker=KXBTC15M&status=open
+const KALSHI_SERIES = {
+  BTC:  process.env.KALSHI_SERIES_BTC  || 'KXBTC15M',
+  ETH:  process.env.KALSHI_SERIES_ETH  || 'KXETH15M',
+  SOL:  process.env.KALSHI_SERIES_SOL  || 'KXSOL15M',
+  XRP:  process.env.KALSHI_SERIES_XRP  || 'KXXRP15M',
+  DOGE: process.env.KALSHI_SERIES_DOGE || 'KXDOGE15M',
+};
 
-  const MONTHS = ['january','february','march','april','may','june',
-                  'july','august','september','october','november','december'];
-  const COINS  = { BTC:'bitcoin', ETH:'ethereum', SOL:'solana',
-                   XRP:'xrp', DOGE:'dogecoin' };
+// Get the currently active market ticker for a Kalshi series
+async function getActiveKalshiMarket(coin) {
+  const series = KALSHI_SERIES[coin];
+  if(!series) return null;
+  try {
+    const r = await fetch(
+      `${CONFIG.kalshiUrl}/trade-api/v2/markets?series_ticker=${series}&status=open&limit=10`
+    );
+    if(!r.ok) return null;
+    const d       = await r.json();
+    const markets = d.markets || [];
+    if(!markets.length) return null;
 
-  const slugs = [];
-  const baseMin = Math.floor(utcM / 5) * 5;
+    // Pick the market with the earliest close_time in the future
+    const now = Math.floor(Date.now()/1000);
+    const future = markets
+      .map(m => {
+        const t = m.close_time
+          ? (typeof m.close_time === 'string'
+              ? Math.floor(new Date(m.close_time).getTime()/1000)
+              : parseInt(m.close_time) > 1e10
+                ? Math.floor(parseInt(m.close_time)/1000)
+                : parseInt(m.close_time))
+          : 0;
+        return { ticker: m.ticker, closeTime: t, yesAsk: m.yes_ask, yesBid: m.yes_bid };
+      })
+      .filter(m => m.closeTime >= now - 30); // allow 30s past close
 
-  for(let i = -2; i < 18; i++) { // -10min past to +90min future
-    const totalMins = etH * 60 + baseMin + i * 5;
-    const sh = Math.floor(totalMins / 60) % 24;
-    const sm = ((totalMins % 60) + 60) % 60;
-    const eh = Math.floor((totalMins + 5) / 60) % 24;
-    const em = ((totalMins + 5) % 60 + 60) % 60;
-
-    const fmt = (h, m) => {
-      const sfx = h < 12 ? 'am' : 'pm';
-      const h12 = h % 12 || 12;
-      return `${h12}-${String(m).padStart(2,'0')}${sfx}`;
-    };
-
-    for(const [coin, name] of Object.entries(COINS)) {
-      slugs.push({
-        coin,
-        slug: `${name}-up-or-down-${MONTHS[etMon]}-${etDay}-${fmt(sh,sm)}-${fmt(eh,em)}-et`,
-      });
-    }
+    if(!future.length) return markets[0] ? { ticker: markets[0].ticker } : null;
+    future.sort((a,b) => a.closeTime - b.closeTime);
+    return future[0];
+  } catch(e) {
+    log('ERROR', `getActiveKalshiMarket(${coin}): ${e.message}`);
+    return null;
   }
-  return slugs;
 }
 
+// Fetch and cache all active Kalshi 15-min markets
+const kalshiMarkets = new Map(); // coin → { ticker, closeTime, yesAsk }
+
+async function refreshKalshiMarkets() {
+  log('INFO', 'Refreshing Kalshi 15-min markets...');
+  for(const coin of Object.keys(KALSHI_SERIES)) {
+    const m = await getActiveKalshiMarket(coin);
+    if(m) {
+      kalshiMarkets.set(coin, m);
+      log('INFO', `✅ Kalshi ${coin}: ${m.ticker} | YES ask: ${m.yesAsk ? m.yesAsk+'¢' : '?'}`);
+    }
+  }
+  log('INFO', `Kalshi markets loaded: ${kalshiMarkets.size}/${Object.keys(KALSHI_SERIES).length}`);
+}
+
+// fetchPolyMarkets now just fetches top trader activity
+// We no longer need Polymarket market IDs — we watch trader wallets directly
+// and match to Kalshi series by coin name
 async function fetchPolyMarkets() {
-  const markets  = [];
-  const slugData = getTodayMarketSlugs();
-  log('INFO', `Fetching today's 5-min markets by slug (${slugData.length} candidates)...`);
-
-  // Batch fetch slugs
-  const batchSize = 10;
-  for(let i = 0; i < slugData.length; i += batchSize) {
-    const batch = slugData.slice(i, i + batchSize);
-    await Promise.all(batch.map(async ({ coin, slug }) => {
-      try {
-        const r = await fetch(
-          `${CONFIG.POLY_REST}/events?slug=${slug}`,
-          { headers:{ 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' } }
-        );
-        if(!r.ok) return;
-        const d    = await r.json();
-        const item = Array.isArray(d) ? d[0] : (d.events?.[0] || d.data?.[0] || d);
-        if(!item || !item.markets) return;
-
-        for(const m of item.markets) {
-          const clobIds    = m.clobTokenIds
-            ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds)
-            : null;
-          const yesTokenId = clobIds?.[0];
-          const noTokenId  = clobIds?.[1];
-          const title      = m.question || m.title || item.title || slug;
-
-          if(!yesTokenId) return;
-
-          markets.push({ coin, title, conditionId: m.conditionId||m.condition_id, yesTokenId, noTokenId, marketId: m.id });
-          log('INFO', `✅ ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,8)}`);
-        }
-      } catch(e) {}
-    }));
-    await new Promise(r => setTimeout(r, 80));
-  }
-
-  // Fallback: events API with today-only filter
-  if(markets.length === 0) {
-    log('INFO', 'Slug fetch empty — trying events API fallback...');
-    const COIN_NAMES = { BTC:['bitcoin','btc'], ETH:['ethereum','eth'],
-                         SOL:['solana','sol'], XRP:['xrp'], DOGE:['doge'] };
-    const now   = new Date();
-    const etNow = new Date(now.getTime() - 4*3600*1000);
-    const MONS  = ['january','february','march','april','may','june',
-                   'july','august','september','october','november','december'];
-    const todayMon = MONS[etNow.getMonth()];
-    const todayDay = String(etNow.getDate());
-
-    for(const offset of [0,100,200,300]) {
-      try {
-        const r = await fetch(
-          `${CONFIG.POLY_REST}/events?active=true&closed=false&limit=100&offset=${offset}`,
-          { headers:{ 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' } }
-        );
-        if(!r.ok) continue;
-        const d     = await r.json();
-        const items = Array.isArray(d) ? d : (d.data||d.events||[]);
-
-        for(const item of items) {
-          for(const m of (item.markets||[item])) {
-            const tl = (m.question||m.title||item.title||'').toLowerCase();
-            if(!tl.includes('up or down')) continue;
-            if(!tl.includes(todayMon) || !tl.includes(todayDay)) continue;
-
-            let coin = null;
-            for(const [c,names] of Object.entries(COIN_NAMES)){
-              if(names.some(n=>tl.includes(n))){ coin=c; break; }
-            }
-            if(!coin) continue;
-
-            const cids = m.clobTokenIds ? (typeof m.clobTokenIds==='string' ? JSON.parse(m.clobTokenIds):m.clobTokenIds) : null;
-            markets.push({ coin, title:m.question||m.title, conditionId:m.conditionId||m.condition_id,
-                           yesTokenId:cids?.[0], noTokenId:cids?.[1], marketId:m.id });
-            log('INFO', `✅ ${coin} (fallback): ${(m.question||'').slice(0,50)}`);
-          }
-        }
-        if(markets.length > 0) break;
-      } catch(e) {}
-    }
-  }
-
-  log('INFO', `Found ${markets.length} active 5-min crypto markets`);
-  return markets;
+  // This is now a no-op for market discovery
+  // Markets are fetched from Kalshi directly via refreshKalshiMarkets()
+  // Return empty array — WebSocket will use trader-address matching instead
+  return [];
 }
 
-
-// ── ALSO POLL RECENT TRADES (FALLBACK) ───────────────────────
-// Since WebSocket may miss some trades, also poll recent trades for top traders
-async function pollRecentTrades(markets) {
-  if(!markets.length) return;
-  const cutoff = Math.floor(Date.now()/1000) - CONFIG.windowSecs;
-
-  // Sample a subset of top traders to poll (CLOB rate limits)
-  const traders = [...TOP_TRADERS].slice(0, 20);
-
-  for(const trader of traders) {
-    try {
-      const r = await fetch(`${CONFIG.CLOB_REST}/trades?user=${trader}&limit=10`);
-      if(!r.ok) continue;
-      const d = await r.json();
-      const trades = d?.data || d || [];
-
-      for(const t of trades) {
-        const ts = t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : 0;
-        if(ts < cutoff) continue;
-
-        // Match to a known market
-        const market = markets.find(m =>
-          m.conditionId === (t.market||t.condition_id) ||
-          m.yesTokenId  === t.asset_id ||
-          m.noTokenId   === t.asset_id
-        );
-        if(!market) continue;
-
-        const side = (market.yesTokenId === t.asset_id ||
-                     (t.side||'').toUpperCase()==='BUY') ? 'YES' : 'NO';
-        const sizeUsd = parseFloat(t.price||0)*parseFloat(t.size||0)*100;
-        if(sizeUsd < CONFIG.minTradeUsd) continue;
-
-        await processTrade({
-          ...t,
-          maker:  trader,
-          taker:  trader,
-          _coin:  market.coin,
-          side:   side==='YES'?'BUY':'SELL',
-          id:     t.id||`${trader}-${ts}`,
-          timestamp: t.timestamp,
-        });
-      }
-      await new Promise(r=>setTimeout(r,150)); // rate limit
-    } catch(e) {}
-  }
-}
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
 let ws = null;
@@ -747,16 +643,12 @@ async function main() {
   );
 
   // Fetch active markets
-  log('INFO', 'Fetching active Polymarket 5-min crypto markets...');
-  const markets = await fetchPolyMarkets();
+  // Load Kalshi markets directly from series tickers
+  await refreshKalshiMarkets();
 
-  if(markets.length === 0) {
-    log('WARN', 'No 5-min markets found via REST — WebSocket will still listen for any trades from top traders');
-    log('WARN', 'This can happen if markets are between windows — will retry in 5min');
-  }
-
-  // Connect WebSocket
-  connectWebSocket(markets);
+  // Start WebSocket for Polymarket trade monitoring
+  // Since we watch by trader address, we don't need specific token IDs
+  connectWebSocket([]);
 
   // Refresh markets every 5 minutes — update list WITHOUT closing WebSocket
   setInterval(async () => {
@@ -788,7 +680,7 @@ async function main() {
   setInterval(() => {
     const secsLeft = secsToNextSettlement();
     const inWindow = inKalshiAlertWindow();
-    log('INFO', `Status | Next settlement: ${nextSettlementTime()} (${secsLeft}s) | In alert window: ${inWindow} | Markets watched: ${wsMarkets.length}`);
+    log('INFO', `Status | Next settlement: ${nextSettlementTime()} (${secsLeft}s) | In alert window: ${inWindow} | Kalshi markets: ${kalshiMarkets.size}`);
 
     // Log current signal states
     for(const [key, state] of signalState) {
