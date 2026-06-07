@@ -346,7 +346,7 @@ async function pollKalshiTrades() {
     if(!market?.ticker) continue;
 
     try {
-      const url = `${CONFIG.kalshiBase}/trade-api/v2/markets/${market.ticker}/trades?limit=20`;
+      const url = `${CONFIG.kalshiBase}/trade-api/v2/trades?ticker=${market.ticker}&limit=20`;
       const r   = await fetch(url);
 
       if(!r.ok) {
