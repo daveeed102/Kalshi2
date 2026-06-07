@@ -388,18 +388,57 @@ async function findPolyMarkets() {
     DOGE: ['doge'],
   };
 
-  try {
-    const r = await fetch(`${CONFIG.POLY_GAMMA}/events?active=true&closed=false&limit=200`, {
-      headers: { 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' }
-    });
-    if(!r.ok) return;
-    const d = await r.json();
-    const items = Array.isArray(d) ? d : (d.events||d.data||[]);
-    let found = 0;
+  // Strategy 1: GET /markets directly — returns array of market objects
+  // Each has clobTokenIds[0]=YES, clobTokenIds[1]=NO
+  const urls = [
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=500&order=volume24hr&ascending=false`,
+    `${CONFIG.POLY_GAMMA}/markets?active=true&closed=false&limit=500`,
+    `${CONFIG.POLY_GAMMA}/events?active=true&closed=false&limit=200`,
+  ];
 
-    for(const item of items) {
-      for(const m of (item.markets||[item])) {
-        const t = (m.question||m.title||item.title||'').toLowerCase();
+  let found = 0;
+
+  for(const url of urls) {
+    try {
+      log('INFO', `Trying: ${url}`);
+      const r = await fetch(url, {
+        headers: { 'Accept':'application/json', 'User-Agent':'Mozilla/5.0' }
+      });
+      if(!r.ok) { log('WARN', `${url} → ${r.status}`); continue; }
+
+      const raw = await r.json();
+      log('INFO', `Response type: ${typeof raw} isArray:${Array.isArray(raw)} keys:${Array.isArray(raw)?'N/A':Object.keys(raw||{}).join(',')}`);
+
+      // Handle both array and object responses
+      let markets = [];
+      if(Array.isArray(raw)) {
+        // /markets returns array directly
+        markets = raw;
+      } else if(Array.isArray(raw.markets)) {
+        markets = raw.markets;
+      } else if(Array.isArray(raw.data)) {
+        // Could be events with nested markets
+        for(const ev of raw.data) {
+          if(Array.isArray(ev.markets)) markets.push(...ev.markets);
+          else markets.push(ev);
+        }
+      } else if(Array.isArray(raw.events)) {
+        for(const ev of raw.events) {
+          if(Array.isArray(ev.markets)) markets.push(...ev.markets);
+        }
+      }
+
+      log('INFO', `Got ${markets.length} market objects to scan`);
+      if(markets.length === 0) continue;
+
+      // Log first item structure for debugging
+      if(markets[0]) {
+        log('INFO', `First market keys: ${Object.keys(markets[0]).join(', ')}`);
+        log('INFO', `First market sample: ${JSON.stringify(markets[0]).slice(0,200)}`);
+      }
+
+      for(const m of markets) {
+        const t = (m.question || m.title || '').toLowerCase();
         if(!t.includes('up or down')) continue;
 
         let coin = null;
@@ -408,20 +447,30 @@ async function findPolyMarkets() {
         }
         if(!coin) continue;
 
-        const condId = m.conditionId || m.condition_id;
-        if(!condId) continue;
+        // clobTokenIds can be array or JSON string
+        let clobIds = m.clobTokenIds;
+        if(typeof clobIds === 'string') {
+          try { clobIds = JSON.parse(clobIds); } catch(e) { clobIds = null; }
+        }
+        const yesId  = clobIds?.[0];
+        const noId   = clobIds?.[1];
+        const condId = m.conditionId || m.condition_id || m.id;
 
-        const clobRaw = m.clobTokenIds;
-        const clobIds = clobRaw ? (typeof clobRaw==='string' ? JSON.parse(clobRaw) : clobRaw) : null;
-        const yesId = clobIds?.[0];
-        const noId  = clobIds?.[1];
+        if(!yesId && !condId) continue;
 
-        polyMarkets.set(condId, { coin, title:m.question||m.title, yesId, noId });
+        polyMarkets.set(condId, { coin, title: m.question || m.title, yesId, noId });
+        log('INFO', `✅ Poly ${coin}: ${(m.question||'').slice(0,50)} | YES:${String(yesId||'').slice(0,10)}`);
         found++;
       }
-    }
-    log('INFO', `Found ${found} Polymarket 5-min crypto markets`);
-  } catch(e) { log('WARN', `findPolyMarkets: ${e.message}`); }
+
+      if(found > 0) {
+        log('INFO', `Found ${found} Polymarket 5-min crypto markets`);
+        return; // success — don't try other URLs
+      }
+    } catch(e) { log('WARN', `findPolyMarkets(${url}): ${e.message}`); }
+  }
+
+  log('WARN', `Found 0 markets — Polymarket API may be returning unexpected format`);
 }
 
 // ── POLYMARKET WEBSOCKET ──────────────────────────────────────
