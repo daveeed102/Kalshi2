@@ -451,8 +451,6 @@ async function fireSignal(coin, side, traders, ts) {
 
 // ── FETCH ACTIVE POLYMARKET 5-MIN CRYPTO MARKETS ─────────────
 // ── KALSHI SERIES TICKERS ────────────────────────────────────
-// These are the permanent series IDs for Kalshi 15-min crypto markets
-// Query: GET /trade-api/v2/markets?series_ticker=KXBTC15M&status=open
 const KALSHI_SERIES = {
   BTC:  process.env.KALSHI_SERIES_BTC  || 'KXBTC15M',
   ETH:  process.env.KALSHI_SERIES_ETH  || 'KXETH15M',
@@ -461,7 +459,114 @@ const KALSHI_SERIES = {
   DOGE: process.env.KALSHI_SERIES_DOGE || 'KXDOGE15M',
 };
 
-// Get the currently active market ticker for a Kalshi series
+// Coin name → Polymarket URL slug prefix
+const COIN_SLUGS = {
+  BTC:  'bitcoin',
+  ETH:  'ethereum',
+  SOL:  'solana',
+  XRP:  'xrp',
+  DOGE: 'dogecoin',
+};
+
+// ── GENERATE CURRENT 5-MIN SLUG ───────────────────────────────
+// Polymarket URL format: /event/bitcoin-up-or-down-june-7-10-00pm-10-05pm-et
+// We generate this from current UTC time converted to ET
+function currentPolySlug(coinName) {
+  const now    = new Date();
+  // Convert UTC to ET (UTC-4 EDT, UTC-5 EST — use UTC-4 for summer)
+  const etMs   = now.getTime() - (4 * 60 * 60 * 1000);
+  const et     = new Date(etMs);
+  const h      = et.getUTCHours();
+  const m      = et.getUTCMinutes();
+  const day    = et.getUTCDate();
+  const month  = et.getUTCMonth(); // 0-indexed
+
+  const MONTHS = ['january','february','march','april','may','june',
+                  'july','august','september','october','november','december'];
+
+  // Round DOWN to nearest 5-min window
+  const startMin = Math.floor(m / 5) * 5;
+  const endMin   = startMin + 5;
+  const startH   = h;
+  const endH     = endMin >= 60 ? h + 1 : h;
+  const endMinN  = endMin >= 60 ? 0 : endMin;
+
+  const fmt = (hh, mm) => {
+    const sfx  = hh < 12 ? 'am' : 'pm';
+    const h12  = hh % 12 === 0 ? 12 : hh % 12;
+    return `${h12}-${String(mm).padStart(2,'0')}${sfx}`;
+  };
+
+  return `${coinName}-up-or-down-${MONTHS[month]}-${day}-${fmt(startH,startMin)}-${fmt(endH,endMinN)}-et`;
+}
+
+// ── FETCH TODAY'S POLYMARKET TOKEN IDs ────────────────────────
+// Uses Gamma API to get clobTokenIds for the current 5-min window
+// No auth required
+async function fetchPolyMarkets() {
+  const markets = [];
+
+  for(const [coin, slugBase] of Object.entries(COIN_SLUGS)) {
+    // Try current window and next window
+    for(let offset = 0; offset <= 1; offset++) {
+      try {
+        const now    = new Date();
+        const etMs   = now.getTime() - (4 * 60 * 60 * 1000) + (offset * 5 * 60 * 1000);
+        const et     = new Date(etMs);
+        const h      = et.getUTCHours();
+        const m      = et.getUTCMinutes();
+        const day    = et.getUTCDate();
+        const month  = et.getUTCMonth();
+        const MONTHS = ['january','february','march','april','may','june',
+                        'july','august','september','october','november','december'];
+        const startMin = Math.floor(m / 5) * 5;
+        const endMin   = startMin + 5;
+        const endH     = endMin >= 60 ? h + 1 : h;
+        const endMinN  = endMin >= 60 ? 0 : endMin;
+        const fmt = (hh, mm) => {
+          const sfx = hh < 12 ? 'am' : 'pm';
+          const h12 = hh % 12 === 0 ? 12 : hh % 12;
+          return `${h12}-${String(mm).padStart(2,'0')}${sfx}`;
+        };
+        const slug = `${slugBase}-up-or-down-${MONTHS[month]}-${day}-${fmt(h,startMin)}-${fmt(endH,endMinN)}-et`;
+
+        // Query Gamma API by slug — no auth needed
+        const r = await fetch(
+          `${CONFIG.POLY_REST}/markets?slug=${slug}&active=true&closed=false`,
+          { headers: { 'Accept': 'application/json' } }
+        );
+        if(!r.ok) continue;
+
+        const d = await r.json();
+        const items = Array.isArray(d) ? d : (d.markets || d.data || []);
+        if(!items.length) continue;
+
+        const m0      = items[0];
+        const clobRaw = m0.clobTokenIds;
+        const clobIds = clobRaw
+          ? (typeof clobRaw === 'string' ? JSON.parse(clobRaw) : clobRaw)
+          : null;
+
+        const yesTokenId = clobIds?.[0];
+        const noTokenId  = clobIds?.[1];
+        if(!yesTokenId) continue;
+
+        const title = m0.question || m0.title || slug;
+        markets.push({ coin, title, conditionId: m0.conditionId || m0.condition_id, yesTokenId, noTokenId, marketId: m0.id });
+        log('INFO', `✅ Poly ${coin}: ${title.slice(0,55)} | YES:${String(yesTokenId).slice(0,10)}`);
+        break; // found this coin — move to next
+      } catch(e) {
+        log('WARN', `Poly slug fetch ${coin}: ${e.message}`);
+      }
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  log('INFO', `Polymarket markets found: ${markets.length}/${Object.keys(COIN_SLUGS).length}`);
+  return markets;
+}
+
+// ── KALSHI MARKET LOOKUP ──────────────────────────────────────
 async function getActiveKalshiMarket(coin) {
   const series = KALSHI_SERIES[coin];
   if(!series) return null;
@@ -474,22 +579,18 @@ async function getActiveKalshiMarket(coin) {
     const markets = d.markets || [];
     if(!markets.length) return null;
 
-    // Pick the market with the earliest close_time in the future
-    const now = Math.floor(Date.now()/1000);
-    const future = markets
-      .map(m => {
-        const t = m.close_time
-          ? (typeof m.close_time === 'string'
-              ? Math.floor(new Date(m.close_time).getTime()/1000)
-              : parseInt(m.close_time) > 1e10
-                ? Math.floor(parseInt(m.close_time)/1000)
-                : parseInt(m.close_time))
-          : 0;
-        return { ticker: m.ticker, closeTime: t, yesAsk: m.yes_ask, yesBid: m.yes_bid };
-      })
-      .filter(m => m.closeTime >= now - 30); // allow 30s past close
+    const now    = Math.floor(Date.now()/1000);
+    const future = markets.map(m => {
+      const ct = m.close_time;
+      const t  = ct
+        ? (typeof ct === 'string'
+            ? Math.floor(new Date(ct).getTime()/1000)
+            : parseInt(ct) > 1e10 ? Math.floor(parseInt(ct)/1000) : parseInt(ct))
+        : 0;
+      return { ticker: m.ticker, closeTime: t, yesAsk: m.yes_ask, yesBid: m.yes_bid };
+    }).filter(m => m.closeTime >= now - 30);
 
-    if(!future.length) return markets[0] ? { ticker: markets[0].ticker } : null;
+    if(!future.length) return { ticker: markets[0].ticker, yesAsk: markets[0].yes_ask };
     future.sort((a,b) => a.closeTime - b.closeTime);
     return future[0];
   } catch(e) {
@@ -498,8 +599,7 @@ async function getActiveKalshiMarket(coin) {
   }
 }
 
-// Fetch and cache all active Kalshi 15-min markets
-const kalshiMarkets = new Map(); // coin → { ticker, closeTime, yesAsk }
+const kalshiMarkets = new Map();
 
 async function refreshKalshiMarkets() {
   log('INFO', 'Refreshing Kalshi 15-min markets...');
@@ -511,16 +611,6 @@ async function refreshKalshiMarkets() {
     }
   }
   log('INFO', `Kalshi markets loaded: ${kalshiMarkets.size}/${Object.keys(KALSHI_SERIES).length}`);
-}
-
-// fetchPolyMarkets now just fetches top trader activity
-// We no longer need Polymarket market IDs — we watch trader wallets directly
-// and match to Kalshi series by coin name
-async function fetchPolyMarkets() {
-  // This is now a no-op for market discovery
-  // Markets are fetched from Kalshi directly via refreshKalshiMarkets()
-  // Return empty array — WebSocket will use trader-address matching instead
-  return [];
 }
 
 
@@ -685,71 +775,18 @@ async function main() {
     if((now - lastPollTime) < interval * 1000) return; // not time yet
     lastPollTime = now;
 
-    // Poll ALL top traders for recent trades
-    const cutoff  = Math.floor(Date.now()/1000) - CONFIG.windowSecs;
-    const traders = [...TOP_TRADERS];
-    let tradesSeen = 0;
-
-    for(const trader of traders) {
-      try {
-        const r = await fetch(`${CONFIG.CLOB_REST}/trades?user=${trader}&limit=20`);
-        if(!r.ok) {
-          log('WARN', `CLOB ${r.status} for ${trader.slice(0,10)}`);
-          continue;
+    // Polling is handled by WebSocket — this just refreshes market list in window
+    if(inWindow && wsMarkets.length === 0) {
+      log('WARN', '  WebSocket has no markets — attempting refresh...');
+      const fresh = await fetchPolyMarkets();
+      if(fresh.length > 0) {
+        wsMarkets = fresh;
+        if(ws?.readyState === WebSocket.OPEN) {
+          const ids = fresh.flatMap(m => [m.yesTokenId, m.noTokenId].filter(Boolean));
+          ws.send(JSON.stringify({ auth:{}, type:'Market', markets:[], assets:ids }));
+          log('INFO', `Re-subscribed to ${ids.length} token IDs`);
         }
-        const d      = await r.json();
-        const trades = d?.data || (Array.isArray(d) ? d : []);
-
-        // First trader — log raw structure so we can see what fields exist
-        if(tradesSeen === 0 && trades.length > 0) {
-          log('INFO', `CLOB sample trade fields: ${Object.keys(trades[0]).join(', ')}`);
-          log('INFO', `CLOB sample: ${JSON.stringify(trades[0]).slice(0,200)}`);
-        }
-
-        for(const t of trades) {
-          const ts = t.timestamp ? Math.floor(new Date(t.timestamp).getTime()/1000) : 0;
-          if(ts < cutoff) continue;
-          tradesSeen++;
-
-          // Match coin from any available title field
-          const title = (t.title || t.market_title || t.market || '').toLowerCase();
-          let coin = null;
-          if(title.includes('bitcoin') || title.includes('btc'))       coin = 'BTC';
-          else if(title.includes('ethereum') || title.includes('eth')) coin = 'ETH';
-          else if(title.includes('solana') || title.includes('sol'))   coin = 'SOL';
-          else if(title.includes('xrp') || title.includes('ripple'))   coin = 'XRP';
-          else if(title.includes('doge'))                               coin = 'DOGE';
-          if(!coin) continue;
-
-          // Accept any crypto up/down market — 5min or 15min
-          if(!title.includes('up or down') && !title.includes('above') && !title.includes('below')) continue;
-
-          const side    = (t.side||t.type||'BUY').toUpperCase().includes('BUY') ? 'BUY' : 'SELL';
-          const sizeUsd = parseFloat(t.price||0) * parseFloat(t.size||t.matched||0) * 100;
-          if(sizeUsd < CONFIG.minTradeUsd) continue;
-
-          log('INFO', `👀 TOP TRADER ${trader.slice(0,10)}... | ${coin} ${side} | $${sizeUsd.toFixed(0)} | ${title.slice(0,40)}`);
-
-          await processTrade({
-            id:        t.id || `${trader}-${ts}`,
-            maker:     trader,
-            taker:     trader,
-            asset_id:  null,
-            price:     t.price,
-            size:      t.size || t.matched,
-            side,
-            timestamp: t.timestamp,
-            _coin:     coin,
-          });
-        }
-        await new Promise(r => setTimeout(r, 80));
-      } catch(e) {
-        log('WARN', `Poll error ${trader.slice(0,10)}: ${e.message}`);
       }
-    }
-
-    if(inWindow && tradesSeen === 0) {
-      log('INFO', `  Polled ${traders.length} traders — 0 matching trades in window`);
     }
 
     // Log status every check when in window, every 5min outside
